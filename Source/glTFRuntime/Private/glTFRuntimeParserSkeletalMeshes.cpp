@@ -651,10 +651,10 @@ USkeletalMesh* FglTFRuntimeParser::CreateSkeletalMeshFromLODs(TSharedRef<FglTFRu
 USkeletalMesh* FglTFRuntimeParser::FinalizeSkeletalMeshWithLODs(TSharedRef<FglTFRuntimeSkeletalMeshContext, ESPMode::ThreadSafe> SkeletalMeshContext)
 {
 
-#if !WITH_EDITOR
+//#if !WITH_EDITOR
 	bool bHasMorphTargets = false;
 	int32 MorphTargetIndex = 0;
-#endif
+//#endif
 
 	for (int32 LODIndex = 0; LODIndex < SkeletalMeshContext->LODs.Num(); LODIndex++)
 	{
@@ -676,7 +676,7 @@ USkeletalMesh* FglTFRuntimeParser::FinalizeSkeletalMeshWithLODs(TSharedRef<FglTF
 			LODInfo.ScreenSize = SkeletalMeshContext->SkeletalMeshConfig.LODScreenSize[LODIndex];
 		}
 
-#if !WITH_EDITOR
+//#if !WITH_EDITOR
 		int32 BaseIndex = 0;
 		for (int32 PrimitiveIndex = 0; PrimitiveIndex < SkeletalMeshContext->LODs[LODIndex].Primitives.Num(); PrimitiveIndex++)
 		{
@@ -718,7 +718,7 @@ USkeletalMesh* FglTFRuntimeParser::FinalizeSkeletalMeshWithLODs(TSharedRef<FglTF
 			BaseIndex += Primitive.Indices.Num();
 		}
 
-#endif
+//#endif
 
 		for (int32 MatIndex = 0; MatIndex < SkeletalMeshContext->LODs[LODIndex].Primitives.Num(); MatIndex++)
 		{
@@ -738,12 +738,13 @@ USkeletalMesh* FglTFRuntimeParser::FinalizeSkeletalMeshWithLODs(TSharedRef<FglTF
 
 #if WITH_EDITOR
 	SkeletalMeshContext->SkeletalMesh->Build();
-#else
+//#else
+#endif
 	if (bHasMorphTargets)
 	{
 		SkeletalMeshContext->SkeletalMesh->InitMorphTargets();
 	}
-#endif
+
 
 	SkeletalMeshContext->SkeletalMesh->CalculateInvRefMatrices();
 

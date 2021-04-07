@@ -1030,6 +1030,8 @@ protected:
 
 	FString BaseDirectory;
 
+	int MorphTargetNameCount;
+
 	template<typename T, typename Callback>
 	bool BuildFromAccessorField(TSharedRef<FJsonObject> JsonObject, const FString& Name, TArray<T>& Data, const TArray<int64>& SupportedElements, const TArray<int64>& SupportedTypes, const bool bNormalized, Callback Filter)
 	{

@@ -10,6 +10,7 @@
 #include "Interfaces/IPluginManager.h"
 
 DEFINE_LOG_CATEGORY(LogGLTFRuntime);
+#pragma optimize("", off)
 
 TSharedPtr<FglTFRuntimeParser> FglTFRuntimeParser::FromFilename(const FString& Filename, const FglTFRuntimeConfig& LoaderConfig)
 {
@@ -262,7 +263,7 @@ TSharedPtr<FglTFRuntimeParser> FglTFRuntimeParser::FromBinary(const uint8* DataP
 FglTFRuntimeParser::FglTFRuntimeParser(TSharedRef<FJsonObject> JsonObject, const FMatrix& InSceneBasis, float InSceneScale) : Root(JsonObject), SceneBasis(InSceneBasis), SceneScale(InSceneScale)
 {
 	bAllNodesCached = false;
-
+	MorphTargetNameCount = 0;
 	UMaterialInterface* OpaqueMaterial = LoadObject<UMaterialInterface>(nullptr, TEXT("/glTFRuntime/M_glTFRuntimeBase"));
 	if (OpaqueMaterial)
 	{
@@ -1497,6 +1498,7 @@ bool FglTFRuntimeParser::LoadPrimitives(TSharedRef<FJsonObject> JsonMeshObject, 
 		const TArray<TSharedPtr<FJsonValue>>* JsonTargetNamesArray;
 		if ((*JsonExtrasObject)->TryGetArrayField("targetNames", JsonTargetNamesArray))
 		{
+			MorphTargetNameCount++;
 			auto ApplyTargetName = [FirstPrimitive, &Primitives](const int32 TargetNameIndex, const FString& TargetName)
 			{
 				int32 MorphTargetCounter = 0;
@@ -1517,7 +1519,14 @@ bool FglTFRuntimeParser::LoadPrimitives(TSharedRef<FJsonObject> JsonMeshObject, 
 			for (int32 TargetNameIndex = 0; TargetNameIndex < JsonTargetNamesArray->Num(); TargetNameIndex++)
 			{
 				const FString TargetName = (*JsonTargetNamesArray)[TargetNameIndex]->AsString();
-				ApplyTargetName(TargetNameIndex, TargetName);
+				if (MorphTargetNameCount == 2)
+				{
+					ApplyTargetName(TargetNameIndex, TargetName + "_Teeth");
+				}
+				else
+				{
+					ApplyTargetName(TargetNameIndex, TargetName);
+				}
 			}
 		}
 	}
@@ -2456,3 +2465,4 @@ bool FglTFRuntimeParser::GetMorphTargetNames(const int32 MeshIndex, TArray<FName
 
 	return true;
 }
+#pragma optimize("", on)

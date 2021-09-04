@@ -729,7 +729,9 @@ USkeletalMesh* FglTFRuntimeParser::FinalizeSkeletalMeshWithLODs(TSharedRef<FglTF
 		}
 #if WITH_EDITOR
 		IMeshBuilderModule& MeshBuilderModule = IMeshBuilderModule::GetForRunningPlatform();
-		if (!MeshBuilderModule.BuildSkeletalMesh(SkeletalMeshContext->SkeletalMesh, LODIndex, false))
+		FSkeletalMeshBuildParameters SkeletalMeshBuildParameters(SkeletalMeshContext->SkeletalMesh, GetTargetPlatformManagerRef().GetRunningTargetPlatform(), LODIndex, false);
+		
+		if (!MeshBuilderModule.BuildSkeletalMesh(SkeletalMeshBuildParameters))
 		{
 			return nullptr;
 		}

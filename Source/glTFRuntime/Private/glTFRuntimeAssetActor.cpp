@@ -56,7 +56,7 @@ void AglTFRuntimeAssetActor::ProcessNode(USceneComponent* NodeParentComponent, F
 	USceneComponent* NewComponent = nullptr;
 	if (Node.CameraIndex != INDEX_NONE)
 	{
-		UCameraComponent* NewCameraComponent = NewObject<UCameraComponent>(this, *Node.Name);
+		UCameraComponent* NewCameraComponent = NewObject<UCameraComponent>(this, GetSafeNodeName<UCameraComponent>(Node));
 		NewCameraComponent->SetupAttachment(NodeParentComponent);
 		NewCameraComponent->RegisterComponent();
 		NewCameraComponent->SetRelativeTransform(Node.Transform);
@@ -67,7 +67,7 @@ void AglTFRuntimeAssetActor::ProcessNode(USceneComponent* NodeParentComponent, F
 	}
 	else if (Node.MeshIndex < 0)
 	{
-		NewComponent = NewObject<USceneComponent>(this, *Node.Name);
+		NewComponent = NewObject<USceneComponent>(this, GetSafeNodeName<USceneComponent>(Node));
 		NewComponent->SetupAttachment(NodeParentComponent);
 		NewComponent->RegisterComponent();
 		NewComponent->SetRelativeTransform(Node.Transform);
@@ -77,7 +77,7 @@ void AglTFRuntimeAssetActor::ProcessNode(USceneComponent* NodeParentComponent, F
 	{
 		if (Node.SkinIndex < 0)
 		{
-			UStaticMeshComponent* StaticMeshComponent = NewObject<UStaticMeshComponent>(this, *Node.Name);
+			UStaticMeshComponent* StaticMeshComponent = NewObject<UStaticMeshComponent>(this, GetSafeNodeName<UStaticMeshComponent>(Node));
 			StaticMeshComponent->SetupAttachment(NodeParentComponent);
 			StaticMeshComponent->RegisterComponent();
 			StaticMeshComponent->SetRelativeTransform(Node.Transform);
@@ -105,7 +105,7 @@ void AglTFRuntimeAssetActor::ProcessNode(USceneComponent* NodeParentComponent, F
 		}
 		else
 		{
-			USkeletalMeshComponent* SkeletalMeshComponent = NewObject<USkeletalMeshComponent>(this, *Node.Name);
+			USkeletalMeshComponent* SkeletalMeshComponent = NewObject<USkeletalMeshComponent>(this, GetSafeNodeName<USkeletalMeshComponent>(Node));
 			SkeletalMeshComponent->SetupAttachment(NodeParentComponent);
 			SkeletalMeshComponent->RegisterComponent();
 			SkeletalMeshComponent->SetRelativeTransform(Node.Transform);
@@ -120,6 +120,22 @@ void AglTFRuntimeAssetActor::ProcessNode(USceneComponent* NodeParentComponent, F
 	if (!NewComponent)
 	{
 		return;
+	}
+
+	// check for audio emitters
+	for (const int32 EmitterIndex : Node.EmitterIndices)
+	{
+		FglTFRuntimeAudioEmitter AudioEmitter;
+		if (Asset->LoadAudioEmitter(EmitterIndex, AudioEmitter))
+		{
+			UAudioComponent* AudioComponent = NewObject<UAudioComponent>(this, *AudioEmitter.Name);
+			AudioComponent->SetupAttachment(NewComponent);
+			AudioComponent->RegisterComponent();
+			AudioComponent->SetRelativeTransform(Node.Transform);
+			AddInstanceComponent(AudioComponent);
+			Asset->LoadEmitterIntoAudioComponent(AudioEmitter, AudioComponent);
+			AudioComponent->Play();
+		}
 	}
 
 	// check for animations

@@ -1,7 +1,7 @@
-// Copyright 2020, Roberto De Ioris.
+// Copyright 2020-2021, Roberto De Ioris.
 
 #include "glTFRuntimeParser.h"
-#include "StaticMeshDescription.h"
+#include "Async/Async.h"
 #include "StaticMeshOperations.h"
 #include "Engine/StaticMeshSocket.h"
 #if WITH_EDITOR
@@ -9,23 +9,116 @@
 #endif
 #include "PhysicsEngine/BodySetup.h"
 
-UStaticMesh* FglTFRuntimeParser::LoadStaticMesh_Internal(TArray<TSharedRef<FJsonObject>> JsonMeshObjects, const FglTFRuntimeStaticMeshConfig& StaticMeshConfig, const TMap<TSharedRef<FJsonObject>, TArray<FglTFRuntimePrimitive>>& PrimitivesCache)
+FglTFRuntimeStaticMeshContext::FglTFRuntimeStaticMeshContext(TSharedRef<FglTFRuntimeParser> InParser, const FglTFRuntimeStaticMeshConfig& InStaticMeshConfig) :
+	Parser(InParser),
+	StaticMeshConfig(InStaticMeshConfig)
 {
-
-	UStaticMesh* StaticMesh = NewObject<UStaticMesh>(StaticMeshConfig.Outer ? StaticMeshConfig.Outer : GetTransientPackage(), NAME_None, RF_Public);
+	StaticMesh = NewObject<UStaticMesh>(StaticMeshConfig.Outer ? StaticMeshConfig.Outer : GetTransientPackage(), NAME_None, RF_Public);
+#if PLATFORM_ANDROID || PLATFORM_IOS
+	StaticMesh->bAllowCPUAccess = false;
+#else
 	StaticMesh->bAllowCPUAccess = StaticMeshConfig.bAllowCPUAccess;
+#endif
+
+#if ENGINE_MAJOR_VERSION > 4 || (ENGINE_MINOR_VERSION > 26)
+	StaticMesh->SetIsBuiltAtRuntime(true);
+#endif
+	StaticMesh->NeverStream = true;
+
+#if ENGINE_MAJOR_VERSION > 4 || (ENGINE_MINOR_VERSION > 26)
+	if (StaticMesh->GetRenderData())
+	{
+		StaticMesh->GetRenderData()->ReleaseResources();
+	}
+	StaticMesh->SetRenderData(MakeUnique<FStaticMeshRenderData>());
+	RenderData = StaticMesh->GetRenderData();
+#else
+	if (StaticMesh->RenderData.IsValid())
+	{
+		StaticMesh->RenderData->ReleaseResources();
+	}
+	StaticMesh->RenderData = MakeUnique<FStaticMeshRenderData>();
+	RenderData = StaticMesh->RenderData.Get();
+#endif
+}
+
+
+void FglTFRuntimeParser::LoadStaticMeshAsync(const int32 MeshIndex, FglTFRuntimeStaticMeshAsync AsyncCallback, const FglTFRuntimeStaticMeshConfig& StaticMeshConfig)
+{
+	// first check cache
+	if (CanReadFromCache(StaticMeshConfig.CacheMode) && StaticMeshesCache.Contains(MeshIndex))
+	{
+		AsyncCallback.ExecuteIfBound(StaticMeshesCache[MeshIndex]);
+		return;
+	}
+
+	TSharedRef<FglTFRuntimeStaticMeshContext, ESPMode::ThreadSafe> StaticMeshContext = MakeShared<FglTFRuntimeStaticMeshContext, ESPMode::ThreadSafe>(AsShared(), StaticMeshConfig);
+
+	Async(EAsyncExecution::Thread, [this, StaticMeshContext, MeshIndex, AsyncCallback]()
+	{
+
+		TSharedPtr<FJsonObject> JsonMeshObject = GetJsonObjectFromRootIndex("meshes", MeshIndex);
+		if (JsonMeshObject)
+		{
+
+			TArray<TSharedRef<FJsonObject>> JsonMeshObjects;
+			JsonMeshObjects.Add(JsonMeshObject.ToSharedRef());
+
+			TMap<TSharedRef<FJsonObject>, TArray<FglTFRuntimePrimitive>> PrimitivesCache;
+			StaticMeshContext->StaticMesh = LoadStaticMesh_Internal(StaticMeshContext, JsonMeshObjects, PrimitivesCache);
+		}
+
+		FGraphEventRef Task = FFunctionGraphTask::CreateAndDispatchWhenReady([MeshIndex, StaticMeshContext, AsyncCallback]()
+		{
+			if (StaticMeshContext->StaticMesh)
+			{
+				StaticMeshContext->StaticMesh = StaticMeshContext->Parser->FinalizeStaticMesh(StaticMeshContext);
+			}
+
+			if (StaticMeshContext->StaticMesh)
+			{
+				if (StaticMeshContext->Parser->CanWriteToCache(StaticMeshContext->StaticMeshConfig.CacheMode))
+				{
+					StaticMeshContext->Parser->StaticMeshesCache.Add(MeshIndex, StaticMeshContext->StaticMesh);
+				}
+			}
+
+			AsyncCallback.ExecuteIfBound(StaticMeshContext->StaticMesh);
+		}, TStatId(), nullptr, ENamedThreads::GameThread);
+		FTaskGraphInterface::Get().WaitUntilTaskCompletes(Task);
+	});
+}
+
+UStaticMesh* FglTFRuntimeParser::LoadStaticMesh_Internal(TSharedRef<FglTFRuntimeStaticMeshContext, ESPMode::ThreadSafe> StaticMeshContext, TArray<TSharedRef<FJsonObject>> JsonMeshObjects, const TMap<TSharedRef<FJsonObject>, TArray<FglTFRuntimePrimitive>>& PrimitivesCache)
+{
+	SCOPED_NAMED_EVENT(FglTFRuntimeParser_LoadStaticMesh_Internal, FColor::Magenta);
+
+	UStaticMesh* StaticMesh = StaticMeshContext->StaticMesh;
+	FStaticMeshRenderData* RenderData = StaticMeshContext->RenderData;
+	const FglTFRuntimeStaticMeshConfig& StaticMeshConfig = StaticMeshContext->StaticMeshConfig;
 
 	bool bHasVertexColors = false;
-	FVector LOD0PivotDelta = FVector::ZeroVector;
 
-	TArray<UStaticMeshDescription*> MeshDescriptions;
+	RenderData->AllocateLODResources(JsonMeshObjects.Num());
 
-	TArray<uint32> LOD0CPUVertexInstancesIDs;
+	int32 LODIndex = 0;
+
+	const float TangentsDirection = StaticMeshConfig.bReverseTangents ? 1 : -1;
 
 	for (TSharedRef<FJsonObject> JsonMeshObject : JsonMeshObjects)
 	{
+		const int32 CurrentLODIndex = LODIndex++;
+		FStaticMeshLODResources& LODResources = RenderData->LODResources[CurrentLODIndex];
+
+#if ENGINE_MAJOR_VERSION > 4
+		FStaticMeshSectionArray& Sections = LODResources.Sections;
+#else
+		FStaticMeshLODResources::FStaticMeshSectionArray& Sections = LODResources.Sections;
+#endif
 
 		TArray<FglTFRuntimePrimitive> Primitives;
+		TArray<uint32> LODIndices;
+
 
 		if (PrimitivesCache.Contains(JsonMeshObject))
 		{
@@ -39,14 +132,10 @@ UStaticMesh* FglTFRuntimeParser::LoadStaticMesh_Internal(TArray<TSharedRef<FJson
 			}
 		}
 
-		UStaticMeshDescription* MeshDescription = UStaticMesh::CreateStaticMeshDescription();
-
-		TArray<FStaticMaterial> StaticMaterials;
-
 		int32 NumUVs = 1;
-		bool bCalculateNormals = false;
-		bool bCalculateTangents = false;
 		FVector PivotDelta = FVector::ZeroVector;
+
+		int32 NumVertexInstancesPerLOD = 0;
 
 		for (FglTFRuntimePrimitive& Primitive : Primitives)
 		{
@@ -55,258 +144,286 @@ UStaticMesh* FglTFRuntimeParser::LoadStaticMesh_Internal(TArray<TSharedRef<FJson
 				NumUVs = Primitive.UVs.Num();
 			}
 
-			if (Primitive.Normals.Num() == 0)
+			if (Primitive.Colors.Num() > 0)
 			{
-				bCalculateNormals = true;
+				bHasVertexColors = true;
 			}
 
-			if (Primitive.Tangents.Num() == 0)
-			{
-				bCalculateTangents = true;
-			}
+			NumVertexInstancesPerLOD += Primitive.Indices.Num();
 		}
+
+		TArray<FStaticMeshBuildVertex> StaticMeshBuildVertices;
+		StaticMeshBuildVertices.SetNum(NumVertexInstancesPerLOD);
+
+		FBox BoundingBox;
+		BoundingBox.Init();
+
+		int32 VertexInstanceBaseIndex = 0;
 
 		for (FglTFRuntimePrimitive& Primitive : Primitives)
 		{
-			FPolygonGroupID PolygonGroupID = MeshDescription->CreatePolygonGroup();
-
-			TPolygonGroupAttributesRef<FName> PolygonGroupMaterialSlotNames = MeshDescription->GetPolygonGroupMaterialSlotNames();
-			FName MaterialName = FName(FString::Printf(TEXT("LOD_%d_Section_%d"), MeshDescriptions.Num(), StaticMaterials.Num()));
-			PolygonGroupMaterialSlotNames[PolygonGroupID] = MaterialName;
+			FName MaterialName = FName(FString::Printf(TEXT("LOD_%d_Section_%d_%s"), CurrentLODIndex, StaticMeshContext->StaticMaterials.Num(), *Primitive.MaterialName));
 			FStaticMaterial StaticMaterial(Primitive.Material, MaterialName);
 			StaticMaterial.UVChannelData.bInitialized = true;
-			StaticMaterials.Add(StaticMaterial);
+			int32 MaterialIndex = StaticMeshContext->StaticMaterials.Add(StaticMaterial);
 
-			TVertexAttributesRef<FVector> PositionsAttributesRef = MeshDescription->GetVertexPositions();
-			TVertexInstanceAttributesRef<FVector> NormalsInstanceAttributesRef = MeshDescription->GetVertexInstanceNormals();
-			TVertexInstanceAttributesRef<FVector> TangentsInstanceAttributesRef = MeshDescription->GetVertexInstanceTangents();
-			TVertexInstanceAttributesRef<FVector2D> UVsInstanceAttributesRef = MeshDescription->GetVertexInstanceUVs();
-			TVertexInstanceAttributesRef<FVector4> ColorsInstanceAttributesRef = MeshDescription->GetVertexInstanceColors();
+			FStaticMeshSection& Section = Sections.AddDefaulted_GetRef();
+			int32 NumVertexInstancesPerSection = Primitive.Indices.Num();
 
-			UVsInstanceAttributesRef.SetNumIndices(NumUVs);
+			Section.NumTriangles = NumVertexInstancesPerSection / 3;
+			Section.FirstIndex = VertexInstanceBaseIndex;
+			Section.bEnableCollision = true;
+			Section.bCastShadow = true;
+			Section.MaterialIndex = MaterialIndex;
 
-			TArray<FVertexInstanceID> VertexInstancesIDs;
-			TArray<FVertexID> VerticesIDs;
-			TArray<FVertexID> TriangleVerticesIDs;
+			bool bMissingNormals = false;
+			bool bMissingTangents = false;
+			bool bMissingIgnore = false;
 
-
-			for (FVector& Position : Primitive.Positions)
+			for (int32 VertexInstanceSectionIndex = 0; VertexInstanceSectionIndex < NumVertexInstancesPerSection; VertexInstanceSectionIndex++)
 			{
-				FVertexID VertexID = MeshDescription->CreateVertex();
-				PositionsAttributesRef[VertexID] = Position;
-				VerticesIDs.Add(VertexID);
-			}
+				uint32 VertexIndex = Primitive.Indices[VertexInstanceSectionIndex];
+				LODIndices.Add(VertexInstanceBaseIndex + VertexInstanceSectionIndex);
 
-			for (uint32 VertexIndex : Primitive.Indices)
-			{
-				if (VertexIndex >= (uint32)VerticesIDs.Num())
-					return nullptr;
+				FStaticMeshBuildVertex& StaticMeshVertex = StaticMeshBuildVertices[VertexInstanceBaseIndex + VertexInstanceSectionIndex];
 
-				FVertexInstanceID NewVertexInstanceID = MeshDescription->CreateVertexInstance(VerticesIDs[VertexIndex]);
+				StaticMeshVertex.Position = GetSafeValue(Primitive.Positions, VertexIndex, FVector::ZeroVector, bMissingIgnore);
+				BoundingBox += StaticMeshVertex.Position;
+				FVector4 TangentX = GetSafeValue(Primitive.Tangents, VertexIndex, FVector4(0, 0, 0, 1), bMissingTangents);
+				StaticMeshVertex.TangentX = TangentX;
+				StaticMeshVertex.TangentZ = GetSafeValue(Primitive.Normals, VertexIndex, FVector::ZeroVector, bMissingNormals);
+				StaticMeshVertex.TangentY = ComputeTangentYWithW(StaticMeshVertex.TangentZ, StaticMeshVertex.TangentX, TangentX.W * TangentsDirection);
 
-				// LOD0 ?
-				if (StaticMesh->bAllowCPUAccess && MeshDescriptions.Num() == 0)
+				for (int32 UVIndex = 0; UVIndex < NumUVs; UVIndex++)
 				{
-					LOD0CPUVertexInstancesIDs.Add(NewVertexInstanceID.GetValue());
+					if (UVIndex < Primitive.UVs.Num())
+					{
+						StaticMeshVertex.UVs[UVIndex] = GetSafeValue(Primitive.UVs[UVIndex], VertexIndex, FVector2D::ZeroVector, bMissingIgnore);
+					}
 				}
 
-				if (Primitive.Normals.Num() > 0)
+				if (bHasVertexColors)
 				{
-					if (VertexIndex >= (uint32)Primitive.Normals.Num())
+					if (VertexIndex < static_cast<uint32>(Primitive.Colors.Num()))
 					{
-						NormalsInstanceAttributesRef[NewVertexInstanceID] = FVector::ZeroVector;
+						StaticMeshVertex.Color = FLinearColor(Primitive.Colors[VertexIndex]).ToFColor(true);
 					}
 					else
 					{
-						NormalsInstanceAttributesRef[NewVertexInstanceID] = Primitive.Normals[VertexIndex];
+						StaticMeshVertex.Color = FColor::White;
 					}
-				}
-
-				if (Primitive.Tangents.Num() > 0)
-				{
-					if (VertexIndex >= (uint32)Primitive.Tangents.Num())
-					{
-						TangentsInstanceAttributesRef[NewVertexInstanceID] = FVector::ZeroVector;
-					}
-					else
-					{
-						TangentsInstanceAttributesRef[NewVertexInstanceID] = Primitive.Tangents[VertexIndex];
-					}
-				}
-
-				if (Primitive.Colors.Num() > 0)
-				{
-					if (VertexIndex >= (uint32)Primitive.Colors.Num())
-					{
-						ColorsInstanceAttributesRef[NewVertexInstanceID] = FVector4(0, 0, 0, 0);
-					}
-					else
-					{
-						ColorsInstanceAttributesRef[NewVertexInstanceID] = Primitive.Colors[VertexIndex];
-					}
-					bHasVertexColors = true;
-				}
-
-				for (int32 UVIndex = 0; UVIndex < Primitive.UVs.Num(); UVIndex++)
-				{
-					if (VertexIndex >= (uint32)Primitive.UVs[UVIndex].Num())
-					{
-						UVsInstanceAttributesRef.Set(NewVertexInstanceID, UVIndex, FVector2D::ZeroVector);
-					}
-					else
-					{
-						UVsInstanceAttributesRef.Set(NewVertexInstanceID, UVIndex, Primitive.UVs[UVIndex][VertexIndex]);
-					}
-				}
-
-				VertexInstancesIDs.Add(NewVertexInstanceID);
-				TriangleVerticesIDs.Add(VerticesIDs[VertexIndex]);
-
-				if (VertexInstancesIDs.Num() == 3)
-				{
-					// degenerate ?
-					if (TriangleVerticesIDs[0] == TriangleVerticesIDs[1] ||
-						TriangleVerticesIDs[1] == TriangleVerticesIDs[2] ||
-						TriangleVerticesIDs[0] == TriangleVerticesIDs[2])
-					{
-						VertexInstancesIDs.Reset();
-						TriangleVerticesIDs.Reset();
-						continue;
-					}
-
-					TArray<FEdgeID> Edges;
-					// fix winding ?
-					if (StaticMeshConfig.bReverseWinding)
-					{
-						VertexInstancesIDs.Swap(1, 2);
-					}
-					FTriangleID TriangleID = MeshDescription->CreateTriangle(PolygonGroupID, VertexInstancesIDs, Edges);
-					if (TriangleID == FTriangleID::Invalid)
-					{
-						return nullptr;
-					}
-					VertexInstancesIDs.Reset();
-					TriangleVerticesIDs.Reset();
 				}
 			}
 
+			if (StaticMeshConfig.bReverseWinding && (NumVertexInstancesPerSection % 3) == 0)
+			{
+				for (int32 VertexInstanceSectionIndex = 0; VertexInstanceSectionIndex < NumVertexInstancesPerSection; VertexInstanceSectionIndex += 3)
+				{
+					FStaticMeshBuildVertex StaticMeshVertex1 = StaticMeshBuildVertices[VertexInstanceBaseIndex + VertexInstanceSectionIndex + 1];
+					FStaticMeshBuildVertex StaticMeshVertex2 = StaticMeshBuildVertices[VertexInstanceBaseIndex + VertexInstanceSectionIndex + 2];
+
+					StaticMeshBuildVertices[VertexInstanceBaseIndex + VertexInstanceSectionIndex + 1] = StaticMeshVertex2;
+					StaticMeshBuildVertices[VertexInstanceBaseIndex + VertexInstanceSectionIndex + 2] = StaticMeshVertex1;
+				}
+			}
+
+			const bool bCanGenerateNormals = (bMissingNormals && StaticMeshConfig.NormalsGenerationStrategy == EglTFRuntimeNormalsGenerationStrategy::IfMissing) ||
+				StaticMeshConfig.NormalsGenerationStrategy == EglTFRuntimeNormalsGenerationStrategy::Always;
+			if (bCanGenerateNormals && (NumVertexInstancesPerSection % 3) == 0)
+			{
+				for (int32 VertexInstanceSectionIndex = 0; VertexInstanceSectionIndex < NumVertexInstancesPerSection; VertexInstanceSectionIndex += 3)
+				{
+					FStaticMeshBuildVertex& StaticMeshVertex0 = StaticMeshBuildVertices[VertexInstanceBaseIndex + VertexInstanceSectionIndex];
+					FStaticMeshBuildVertex& StaticMeshVertex1 = StaticMeshBuildVertices[VertexInstanceBaseIndex + VertexInstanceSectionIndex + 1];
+					FStaticMeshBuildVertex& StaticMeshVertex2 = StaticMeshBuildVertices[VertexInstanceBaseIndex + VertexInstanceSectionIndex + 2];
+
+					FVector SideA = StaticMeshVertex1.Position - StaticMeshVertex0.Position;
+					FVector SideB = StaticMeshVertex2.Position - StaticMeshVertex0.Position;
+
+					FVector NormalFromCross = FVector::CrossProduct(SideB, SideA).GetSafeNormal();
+
+					StaticMeshVertex0.TangentZ = NormalFromCross;
+					StaticMeshVertex1.TangentZ = NormalFromCross;
+					StaticMeshVertex2.TangentZ = NormalFromCross;
+				}
+				bMissingNormals = false;
+			}
+
+			const bool bCanGenerateTangents = (bMissingTangents && StaticMeshConfig.TangentsGenerationStrategy == EglTFRuntimeTangentsGenerationStrategy::IfMissing) ||
+				StaticMeshConfig.TangentsGenerationStrategy == EglTFRuntimeTangentsGenerationStrategy::Always;
+			// recompute tangents if required (need normals and uvs)
+			if (bCanGenerateTangents && !bMissingNormals && Primitive.UVs.Num() > 0 && (NumVertexInstancesPerSection % 3) == 0)
+			{
+				for (int32 VertexInstanceSectionIndex = 0; VertexInstanceSectionIndex < NumVertexInstancesPerSection; VertexInstanceSectionIndex += 3)
+				{
+					FStaticMeshBuildVertex& StaticMeshVertex0 = StaticMeshBuildVertices[VertexInstanceBaseIndex + VertexInstanceSectionIndex];
+					FStaticMeshBuildVertex& StaticMeshVertex1 = StaticMeshBuildVertices[VertexInstanceBaseIndex + VertexInstanceSectionIndex + 1];
+					FStaticMeshBuildVertex& StaticMeshVertex2 = StaticMeshBuildVertices[VertexInstanceBaseIndex + VertexInstanceSectionIndex + 2];
+
+					FVector Position0 = StaticMeshVertex0.Position;
+					FVector4 TangentZ0 = StaticMeshVertex0.TangentZ;
+					FVector2D UV0 = StaticMeshVertex0.UVs[0];
+
+					FVector Position1 = StaticMeshVertex1.Position;
+					FVector4 TangentZ1 = StaticMeshVertex1.TangentZ;
+					FVector2D UV1 = StaticMeshVertex1.UVs[0];
+
+					FVector Position2 = StaticMeshVertex2.Position;
+					FVector4 TangentZ2 = StaticMeshVertex2.TangentZ;
+					FVector2D UV2 = StaticMeshVertex2.UVs[0];
+
+					FVector DeltaPosition0 = Position1 - Position0;
+					FVector DeltaPosition1 = Position2 - Position0;
+
+					FVector2D DeltaUV0 = UV1 - UV0;
+					FVector2D DeltaUV1 = UV2 - UV0;
+
+					float Factor = 1.0f / (DeltaUV0.X * DeltaUV1.Y - DeltaUV0.Y * DeltaUV1.X);
+
+					FVector TriangleTangentX = ((DeltaPosition0 * DeltaUV1.Y) - (DeltaPosition1 * DeltaUV0.Y)) * Factor;
+					FVector TriangleTangentY = ((DeltaPosition0 * DeltaUV1.X) - (DeltaPosition1 * DeltaUV0.X)) * Factor;
+
+					FVector TangentX0 = TriangleTangentX - (TangentZ0 * FVector::DotProduct(TangentZ0, TriangleTangentX));
+					TangentX0.Normalize();
+
+					FVector TangentX1 = TriangleTangentX - (TangentZ1 * FVector::DotProduct(TangentZ1, TriangleTangentX));
+					TangentX1.Normalize();
+
+					FVector TangentX2 = TriangleTangentX - (TangentZ2 * FVector::DotProduct(TangentZ2, TriangleTangentX));
+					TangentX2.Normalize();
+
+					StaticMeshVertex0.TangentX = TangentX0;
+					StaticMeshVertex0.TangentY = ComputeTangentY(StaticMeshVertex0.TangentZ, StaticMeshVertex0.TangentX) * TangentsDirection;
+
+					StaticMeshVertex1.TangentX = TangentX1;
+					StaticMeshVertex1.TangentY = ComputeTangentY(StaticMeshVertex1.TangentZ, StaticMeshVertex1.TangentX) * TangentsDirection;
+
+					StaticMeshVertex2.TangentX = TangentX2;
+					StaticMeshVertex2.TangentY = ComputeTangentY(StaticMeshVertex2.TangentZ, StaticMeshVertex2.TangentX) * TangentsDirection;
+
+				}
+			}
+
+			VertexInstanceBaseIndex += NumVertexInstancesPerSection;
 		}
 
-
+		// check for pivot repositioning
 		if (StaticMeshConfig.PivotPosition != EglTFRuntimePivotPosition::Asset)
 		{
-			FBoxSphereBounds MeshBounds = MeshDescription->GetMeshDescription().GetBounds();
-			TVertexAttributesRef<FVector> VertexPositions = MeshDescription->GetVertexPositions();
-
 			if (StaticMeshConfig.PivotPosition == EglTFRuntimePivotPosition::Center)
 			{
-				PivotDelta = MeshBounds.GetSphere().Center;
+				PivotDelta = BoundingBox.GetCenter();
 			}
 			else if (StaticMeshConfig.PivotPosition == EglTFRuntimePivotPosition::Top)
 			{
-				PivotDelta = MeshBounds.GetBox().GetCenter() + FVector(0, 0, MeshBounds.GetBox().GetExtent().Z);
+				PivotDelta = BoundingBox.GetCenter() + FVector(0, 0, BoundingBox.GetExtent().Z);
 			}
 			else if (StaticMeshConfig.PivotPosition == EglTFRuntimePivotPosition::Bottom)
 			{
-				PivotDelta = MeshBounds.GetBox().GetCenter() - FVector(0, 0, MeshBounds.GetBox().GetExtent().Z);
+				PivotDelta = BoundingBox.GetCenter() - FVector(0, 0, BoundingBox.GetExtent().Z);
 			}
 
-			for (const FVertexID VertexID : MeshDescription->Vertices().GetElementIDs())
+			for (FStaticMeshBuildVertex& StaticMeshVertex : StaticMeshBuildVertices)
 			{
-				VertexPositions[VertexID] -= PivotDelta;
+				StaticMeshVertex.Position -= PivotDelta;
 			}
 
-			if (MeshDescriptions.Num() == 0)
+			if (CurrentLODIndex == 0)
 			{
-				LOD0PivotDelta = PivotDelta;
+				StaticMeshContext->LOD0PivotDelta = PivotDelta;
 			}
 		}
 
-		StaticMesh->StaticMaterials.Append(StaticMaterials);
-
-		
-		if (bCalculateNormals || bCalculateTangents)
+		if (CurrentLODIndex == 0)
 		{
-			FStaticMeshOperations::ComputePolygonTangentsAndNormals(MeshDescription->GetMeshDescription());
-			EComputeNTBsFlags NTPBsFlags = EComputeNTBsFlags::None;
-			if (bCalculateNormals)
+			BoundingBox.GetCenterAndExtents(StaticMeshContext->BoundingBoxAndSphere.Origin, StaticMeshContext->BoundingBoxAndSphere.BoxExtent);
+			StaticMeshContext->BoundingBoxAndSphere.SphereRadius = 0.0f;
+			for (const FStaticMeshBuildVertex& StaticMeshVertex : StaticMeshBuildVertices)
 			{
-				NTPBsFlags |= EComputeNTBsFlags::Normals;
+				StaticMeshContext->BoundingBoxAndSphere.SphereRadius = FMath::Max((StaticMeshVertex.Position - StaticMeshContext->BoundingBoxAndSphere.Origin).Size(), StaticMeshContext->BoundingBoxAndSphere.SphereRadius);
 			}
-			if (bCalculateTangents)
-			{
-				NTPBsFlags |= EComputeNTBsFlags::Tangents;
-			}
-			FStaticMeshOperations::ComputeTangentsAndNormals(MeshDescription->GetMeshDescription(), NTPBsFlags);
 		}
 
-		MeshDescriptions.Add(MeshDescription);
+		LODResources.VertexBuffers.PositionVertexBuffer.Init(StaticMeshBuildVertices, StaticMesh->bAllowCPUAccess);
+		LODResources.VertexBuffers.StaticMeshVertexBuffer.Init(StaticMeshBuildVertices, NumUVs, StaticMesh->bAllowCPUAccess);
+		if (bHasVertexColors)
+		{
+			LODResources.VertexBuffers.ColorVertexBuffer.Init(StaticMeshBuildVertices, StaticMesh->bAllowCPUAccess);
+		}
+		LODResources.bHasColorVertexData = bHasVertexColors;
+		if (StaticMesh->bAllowCPUAccess)
+		{
+			LODResources.IndexBuffer = FRawStaticIndexBuffer(true);
+		}
+		LODResources.IndexBuffer.SetIndices(LODIndices, EIndexBufferStride::Force32Bit);
+		}
+
+	return StaticMesh;
 	}
 
-	StaticMesh->BuildFromStaticMeshDescriptions(MeshDescriptions, false);
+UStaticMesh* FglTFRuntimeParser::FinalizeStaticMesh(TSharedRef<FglTFRuntimeStaticMeshContext, ESPMode::ThreadSafe> StaticMeshContext)
+{
+	SCOPED_NAMED_EVENT(FglTFRuntimeParser_FinalizeStaticMesh, FColor::Magenta);
 
-	bool bIsMobile = GMaxRHIFeatureLevel == ERHIFeatureLevel::ES3_1;
-#if WITH_EDITOR
-	UEditorEngine* Editor = (UEditorEngine*)GEngine;
-	bIsMobile |= Editor->GetActiveFeatureLevelPreviewType() == ERHIFeatureLevel::ES3_1;
+	UStaticMesh* StaticMesh = StaticMeshContext->StaticMesh;
+	FStaticMeshRenderData* RenderData = StaticMeshContext->RenderData;
+	const FglTFRuntimeStaticMeshConfig& StaticMeshConfig = StaticMeshContext->StaticMeshConfig;
+
+#if ENGINE_MAJOR_VERSION > 4 || (ENGINE_MINOR_VERSION > 26)
+	StaticMesh->SetStaticMaterials(StaticMeshContext->StaticMaterials);
+#else
+	StaticMesh->StaticMaterials = StaticMeshContext->StaticMaterials;
 #endif
 
-	if ((bHasVertexColors || bIsMobile) && StaticMesh->RenderData && StaticMesh->RenderData->LODResources.Num() > 0)
-	{
-		StaticMesh->ReleaseResources();
-		for (int32 LODIndex = 0; LODIndex < StaticMesh->RenderData->LODResources.Num(); LODIndex++)
-		{
-			StaticMesh->RenderData->LODResources[LODIndex].bHasColorVertexData = true;
-		}
-		StaticMesh->InitResources();
-	}
+#if ENGINE_MAJOR_VERSION > 4 || (ENGINE_MINOR_VERSION > 26)
+	UBodySetup* BodySetup = StaticMesh->GetBodySetup();
+#else
+	UBodySetup* BodySetup = StaticMesh->BodySetup;
+#endif
 
 	// Override LODs ScreenSize
 	for (const TPair<int32, float>& Pair : StaticMeshConfig.LODScreenSize)
 	{
 		int32 CurrentLODIndex = Pair.Key;
-		if (StaticMesh->RenderData && CurrentLODIndex >= 0 && CurrentLODIndex < StaticMesh->RenderData->LODResources.Num())
+		if (RenderData && CurrentLODIndex >= 0 && CurrentLODIndex < RenderData->LODResources.Num())
 		{
-			StaticMesh->RenderData->ScreenSize[CurrentLODIndex].Default = Pair.Value;
-		}
+			RenderData->ScreenSize[CurrentLODIndex].Default = Pair.Value;
 	}
+}
 
-	if (!StaticMesh->BodySetup)
+	StaticMesh->InitResources();
+
+	RenderData->Bounds = StaticMeshContext->BoundingBoxAndSphere;
+	StaticMesh->CalculateExtendedBounds();
+
+	if (!BodySetup)
 	{
 		StaticMesh->CreateBodySetup();
+#if ENGINE_MAJOR_VERSION > 4 || (ENGINE_MINOR_VERSION > 26)
+		BodySetup = StaticMesh->GetBodySetup();
+#else
+		BodySetup = StaticMesh->BodySetup;
+#endif
 	}
 
-	StaticMesh->BodySetup->bMeshCollideAll = false;
-	StaticMesh->BodySetup->CollisionTraceFlag = StaticMeshConfig.CollisionComplexity;
-
-	StaticMesh->BodySetup->InvalidatePhysicsData();
-
-	// required for building complex collisions
-#if !WITH_EDITOR
-	if (!bIsMobile && StaticMesh->bAllowCPUAccess && StaticMesh->RenderData && StaticMesh->RenderData->LODResources.Num() > 0)
+	if (!StaticMesh->bAllowCPUAccess)
 	{
-		FStaticMeshLODResources& LOD = StaticMesh->RenderData->LODResources[0];
-		ENQUEUE_RENDER_COMMAND(FixIndexBufferOnCPUCommand)(
-			[&LOD, &LOD0CPUVertexInstancesIDs](FRHICommandListImmediate& RHICmdList)
-		{
-			LOD.IndexBuffer.ReleaseResource();
-			LOD.IndexBuffer = FRawStaticIndexBuffer(true);
-			LOD.IndexBuffer.SetIndices(LOD0CPUVertexInstancesIDs, EIndexBufferStride::AutoDetect);
-			LOD.IndexBuffer.InitResource();
-		});
+		BodySetup->bNeverNeedsCookedCollisionData = true;
+	}
 
-		FlushRenderingCommands();
-}
-#endif
+	BodySetup->bMeshCollideAll = false;
+	BodySetup->CollisionTraceFlag = StaticMeshConfig.CollisionComplexity;
+
+	BodySetup->InvalidatePhysicsData();
 
 	if (StaticMeshConfig.bBuildSimpleCollision)
 	{
 		FKBoxElem BoxElem;
-		BoxElem.Center = StaticMesh->RenderData->Bounds.Origin;
-		BoxElem.X = StaticMesh->RenderData->Bounds.BoxExtent.X * 2.0f;
-		BoxElem.Y = StaticMesh->RenderData->Bounds.BoxExtent.Y * 2.0f;
-		BoxElem.Z = StaticMesh->RenderData->Bounds.BoxExtent.Z * 2.0f;
-		StaticMesh->BodySetup->AggGeom.BoxElems.Add(BoxElem);
+		BoxElem.Center = RenderData->Bounds.Origin;
+		BoxElem.X = RenderData->Bounds.BoxExtent.X * 2.0f;
+		BoxElem.Y = RenderData->Bounds.BoxExtent.Y * 2.0f;
+		BoxElem.Z = RenderData->Bounds.BoxExtent.Z * 2.0f;
+		BodySetup->AggGeom.BoxElems.Add(BoxElem);
 	}
 
 	for (const FBox& Box : StaticMeshConfig.BoxCollisions)
@@ -317,7 +434,7 @@ UStaticMesh* FglTFRuntimeParser::LoadStaticMesh_Internal(TArray<TSharedRef<FJson
 		BoxElem.X = BoxSize.X;
 		BoxElem.Y = BoxSize.Y;
 		BoxElem.Z = BoxSize.Z;
-		StaticMesh->BodySetup->AggGeom.BoxElems.Add(BoxElem);
+		BodySetup->AggGeom.BoxElems.Add(BoxElem);
 	}
 
 	for (const FVector4 Sphere : StaticMeshConfig.SphereCollisions)
@@ -325,10 +442,10 @@ UStaticMesh* FglTFRuntimeParser::LoadStaticMesh_Internal(TArray<TSharedRef<FJson
 		FKSphereElem SphereElem;
 		SphereElem.Center = Sphere;
 		SphereElem.Radius = Sphere.W;
-		StaticMesh->BodySetup->AggGeom.SphereElems.Add(SphereElem);
+		BodySetup->AggGeom.SphereElems.Add(SphereElem);
 	}
 
-	StaticMesh->BodySetup->CreatePhysicsMeshes();
+	BodySetup->CreatePhysicsMeshes();
 
 	for (const TPair<FString, FTransform>& Pair : StaticMeshConfig.Sockets)
 	{
@@ -344,7 +461,7 @@ UStaticMesh* FglTFRuntimeParser::LoadStaticMesh_Internal(TArray<TSharedRef<FJson
 	{
 		UStaticMeshSocket* Socket = NewObject<UStaticMeshSocket>(StaticMesh);
 		Socket->SocketName = FName(StaticMeshConfig.ExportOriginalPivotToSocket);
-		Socket->RelativeLocation = -LOD0PivotDelta;
+		Socket->RelativeLocation = -StaticMeshContext->LOD0PivotDelta;
 		StaticMesh->AddSocket(Socket);
 	}
 
@@ -395,8 +512,16 @@ UStaticMesh* FglTFRuntimeParser::LoadStaticMesh(const int32 MeshIndex, const Fgl
 	TArray<TSharedRef<FJsonObject>> JsonMeshObjects;
 	JsonMeshObjects.Add(JsonMeshObject.ToSharedRef());
 
+	TSharedRef<FglTFRuntimeStaticMeshContext, ESPMode::ThreadSafe> StaticMeshContext = MakeShared<FglTFRuntimeStaticMeshContext, ESPMode::ThreadSafe>(AsShared(), StaticMeshConfig);
+
 	TMap<TSharedRef<FJsonObject>, TArray<FglTFRuntimePrimitive>> PrimitivesCache;
-	UStaticMesh* StaticMesh = LoadStaticMesh_Internal(JsonMeshObjects, StaticMeshConfig, PrimitivesCache);
+	UStaticMesh* StaticMesh = LoadStaticMesh_Internal(StaticMeshContext, JsonMeshObjects, PrimitivesCache);
+	if (!StaticMesh)
+	{
+		return nullptr;
+	}
+
+	StaticMesh = FinalizeStaticMesh(StaticMeshContext);
 	if (!StaticMesh)
 	{
 		return nullptr;
@@ -436,7 +561,15 @@ TArray<UStaticMesh*> FglTFRuntimeParser::LoadStaticMeshesFromPrimitives(const in
 		SinglePrimitive.Add(Primitive);
 		PrimitivesCache.Add(JsonMeshObject.ToSharedRef(), SinglePrimitive);
 
-		UStaticMesh* StaticMesh = LoadStaticMesh_Internal(JsonMeshObjects, StaticMeshConfig, PrimitivesCache);
+		TSharedRef<FglTFRuntimeStaticMeshContext, ESPMode::ThreadSafe> StaticMeshContext = MakeShared<FglTFRuntimeStaticMeshContext, ESPMode::ThreadSafe>(AsShared(), StaticMeshConfig);
+
+		UStaticMesh* StaticMesh = LoadStaticMesh_Internal(StaticMeshContext, JsonMeshObjects, PrimitivesCache);
+		if (!StaticMesh)
+		{
+			break;
+		}
+
+		StaticMesh = FinalizeStaticMesh(StaticMeshContext);
 		if (!StaticMesh)
 		{
 			break;
@@ -463,8 +596,54 @@ UStaticMesh* FglTFRuntimeParser::LoadStaticMeshLODs(const TArray<int32> MeshIndi
 		JsonMeshObjects.Add(JsonMeshObject.ToSharedRef());
 	}
 
+	TSharedRef<FglTFRuntimeStaticMeshContext, ESPMode::ThreadSafe> StaticMeshContext = MakeShared<FglTFRuntimeStaticMeshContext, ESPMode::ThreadSafe>(AsShared(), StaticMeshConfig);
+
 	TMap<TSharedRef<FJsonObject>, TArray<FglTFRuntimePrimitive>> PrimitivesCache;
-	return LoadStaticMesh_Internal(JsonMeshObjects, StaticMeshConfig, PrimitivesCache);
+	UStaticMesh* StaticMesh = LoadStaticMesh_Internal(StaticMeshContext, JsonMeshObjects, PrimitivesCache);
+	if (StaticMesh)
+	{
+		return FinalizeStaticMesh(StaticMeshContext);
+	}
+	return nullptr;
+}
+
+void FglTFRuntimeParser::LoadStaticMeshLODsAsync(const TArray<int32> MeshIndices, FglTFRuntimeStaticMeshAsync AsyncCallback, const FglTFRuntimeStaticMeshConfig& StaticMeshConfig)
+{
+	TSharedRef<FglTFRuntimeStaticMeshContext, ESPMode::ThreadSafe> StaticMeshContext = MakeShared<FglTFRuntimeStaticMeshContext, ESPMode::ThreadSafe>(AsShared(), StaticMeshConfig);
+
+	Async(EAsyncExecution::Thread, [this, StaticMeshContext, MeshIndices, AsyncCallback]()
+	{
+		TArray<TSharedRef<FJsonObject>> JsonMeshObjects;
+		bool bSuccess = true;
+		for (const int32 MeshIndex : MeshIndices)
+		{
+			TSharedPtr<FJsonObject> JsonMeshObject = GetJsonObjectFromRootIndex("meshes", MeshIndex);
+			if (!JsonMeshObject)
+			{
+				bSuccess = false;
+				break;
+			}
+
+			JsonMeshObjects.Add(JsonMeshObject.ToSharedRef());
+		}
+
+		if (bSuccess)
+		{
+			TMap<TSharedRef<FJsonObject>, TArray<FglTFRuntimePrimitive>> PrimitivesCache;
+			StaticMeshContext->StaticMesh = LoadStaticMesh_Internal(StaticMeshContext, JsonMeshObjects, PrimitivesCache);
+		}
+
+		FGraphEventRef Task = FFunctionGraphTask::CreateAndDispatchWhenReady([StaticMeshContext, AsyncCallback]()
+		{
+			if (StaticMeshContext->StaticMesh)
+			{
+				StaticMeshContext->StaticMesh = StaticMeshContext->Parser->FinalizeStaticMesh(StaticMeshContext);
+			}
+
+			AsyncCallback.ExecuteIfBound(StaticMeshContext->StaticMesh);
+		}, TStatId(), nullptr, ENamedThreads::GameThread);
+		FTaskGraphInterface::Get().WaitUntilTaskCompletes(Task);
+	});
 }
 
 bool FglTFRuntimeParser::LoadStaticMeshIntoProceduralMeshComponent(const int32 MeshIndex, UProceduralMeshComponent* ProceduralMeshComponent, const FglTFRuntimeProceduralMeshConfig& ProceduralMeshConfig)

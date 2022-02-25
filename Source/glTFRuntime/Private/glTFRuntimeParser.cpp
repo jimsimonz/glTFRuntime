@@ -1,4 +1,4 @@
-// Copyright 2020, Roberto De Ioris.
+// Copyright 2020-2021, Roberto De Ioris.
 
 #include "glTFRuntimeParser.h"
 #include "Misc/FileHelper.h"
@@ -10,10 +10,11 @@
 #include "Interfaces/IPluginManager.h"
 
 DEFINE_LOG_CATEGORY(LogGLTFRuntime);
-#pragma optimize("", off)
 
 TSharedPtr<FglTFRuntimeParser> FglTFRuntimeParser::FromFilename(const FString& Filename, const FglTFRuntimeConfig& LoaderConfig)
 {
+	SCOPED_NAMED_EVENT(FglTFRuntimeParser_FromFilename, FColor::Magenta);
+
 	FString TruePath = Filename;
 
 	if (LoaderConfig.bSearchContentDir)
@@ -65,6 +66,8 @@ TSharedPtr<FglTFRuntimeParser> FglTFRuntimeParser::FromFilename(const FString& F
 
 TSharedPtr<FglTFRuntimeParser> FglTFRuntimeParser::FromData(const uint8* DataPtr, int64 DataNum, const FglTFRuntimeConfig& LoaderConfig)
 {
+	SCOPED_NAMED_EVENT(FglTFRuntimeParser_FromData, FColor::Magenta);
+
 	// required for Gzip;
 	TArray<uint8> UncompressedData;
 
@@ -150,6 +153,53 @@ TSharedPtr<FglTFRuntimeParser> FglTFRuntimeParser::FromData(const uint8* DataPtr
 		DataNum = *GzipOriginalSize;
 	}
 
+	// Zip archive ?
+	TSharedPtr<FglTFRuntimeZipFile> ZipFile = nullptr;
+	TArray64<uint8> UnzippedData;
+	if (DataNum > 4 && DataPtr[0] == 0x50 && DataPtr[1] == 0x4b && DataPtr[2] == 0x03 && DataPtr[3] == 0x04)
+	{
+		ZipFile = MakeShared<FglTFRuntimeZipFile>();
+		if (!ZipFile->FromData(DataPtr, DataNum))
+		{
+			UE_LOG(LogGLTFRuntime, Error, TEXT("Unable to parse Zip archive."));
+			return nullptr;
+		}
+
+		FString Filename = LoaderConfig.ArchiveEntryPoint;
+
+		if (Filename.IsEmpty())
+		{
+			TArray<FString> Extensions;
+			LoaderConfig.ArchiveAutoEntryPointExtensions.ParseIntoArray(Extensions, TEXT(" "), true);
+			for (const FString& Extension : Extensions)
+			{
+				Filename = ZipFile->GetFirstFilenameByExtension(Extension);
+				if (!Filename.IsEmpty())
+				{
+					break;
+				}
+			}
+		}
+
+		if (Filename.IsEmpty())
+		{
+			UE_LOG(LogGLTFRuntime, Error, TEXT("Unable to find entry point from Zip archive."), *Filename);
+			return nullptr;
+		}
+
+		if (!ZipFile->GetFileContent(Filename, UnzippedData))
+		{
+			UE_LOG(LogGLTFRuntime, Error, TEXT("Unable to get %s from Zip archive."), *Filename);
+			return nullptr;
+		}
+
+		if (UnzippedData.Num() > 0)
+		{
+			DataPtr = UnzippedData.GetData();
+			DataNum = UnzippedData.Num();
+		}
+	}
+
 	// detect binary format
 	if (DataNum > 20)
 	{
@@ -158,20 +208,24 @@ TSharedPtr<FglTFRuntimeParser> FglTFRuntimeParser::FromData(const uint8* DataPtr
 			DataPtr[2] == 0x54 &&
 			DataPtr[3] == 0x46)
 		{
-			return FromBinary(DataPtr, DataNum, LoaderConfig);
+			return FromBinary(DataPtr, DataNum, LoaderConfig, ZipFile);
 		}
 	}
-	if (DataNum <= INT32_MAX)
+
+	if (DataNum > 0 && DataNum <= INT32_MAX)
 	{
 		FString JsonData;
 		FFileHelper::BufferToString(JsonData, DataPtr, (int32)DataNum);
-		return FromString(JsonData, LoaderConfig);
+		return FromString(JsonData, LoaderConfig, ZipFile);
 	}
+
 	return nullptr;
 }
 
-TSharedPtr<FglTFRuntimeParser> FglTFRuntimeParser::FromString(const FString& JsonData, const FglTFRuntimeConfig& LoaderConfig)
+TSharedPtr<FglTFRuntimeParser> FglTFRuntimeParser::FromString(const FString& JsonData, const FglTFRuntimeConfig& LoaderConfig, TSharedPtr<FglTFRuntimeZipFile> InZipFile)
 {
+	SCOPED_NAMED_EVENT(FglTFRuntimeParser_FromString, FColor::Magenta);
+
 	TSharedPtr<FJsonValue> RootValue;
 
 	TSharedRef<TJsonReader<TCHAR>> JsonReader = TJsonReaderFactory<TCHAR>::Create(JsonData);
@@ -199,13 +253,17 @@ TSharedPtr<FglTFRuntimeParser> FglTFRuntimeParser::FromString(const FString& Jso
 				Parser->BaseDirectory = LoaderConfig.OverrideBaseDirectory;
 			}
 		}
+
+		Parser->ZipFile = InZipFile;
 	}
 
 	return Parser;
 }
 
-TSharedPtr<FglTFRuntimeParser> FglTFRuntimeParser::FromBinary(const uint8* DataPtr, int64 DataNum, const FglTFRuntimeConfig& LoaderConfig)
+TSharedPtr<FglTFRuntimeParser> FglTFRuntimeParser::FromBinary(const uint8* DataPtr, int64 DataNum, const FglTFRuntimeConfig& LoaderConfig, TSharedPtr<FglTFRuntimeZipFile> InZipFile)
 {
+	SCOPED_NAMED_EVENT(FglTFRuntimeParser_FromBinary, FColor::Magenta);
+
 	FString JsonData;
 	TArray64<uint8> BinaryBuffer;
 
@@ -250,11 +308,14 @@ TSharedPtr<FglTFRuntimeParser> FglTFRuntimeParser::FromBinary(const uint8* DataP
 		return nullptr;
 	}
 
-	TSharedPtr<FglTFRuntimeParser> Parser = FromString(JsonData, LoaderConfig);
+	TSharedPtr<FglTFRuntimeParser> Parser = FromString(JsonData, LoaderConfig, InZipFile);
 
-	if (Parser && bBinaryFound)
+	if (Parser)
 	{
-		Parser->SetBinaryBuffer(BinaryBuffer);
+		if (bBinaryFound)
+		{
+			Parser->SetBinaryBuffer(BinaryBuffer);
+		}
 	}
 
 	return Parser;
@@ -263,7 +324,7 @@ TSharedPtr<FglTFRuntimeParser> FglTFRuntimeParser::FromBinary(const uint8* DataP
 FglTFRuntimeParser::FglTFRuntimeParser(TSharedRef<FJsonObject> JsonObject, const FMatrix& InSceneBasis, float InSceneScale) : Root(JsonObject), SceneBasis(InSceneBasis), SceneScale(InSceneScale)
 {
 	bAllNodesCached = false;
-	MorphTargetNameCount = 0;
+
 	UMaterialInterface* OpaqueMaterial = LoadObject<UMaterialInterface>(nullptr, TEXT("/glTFRuntime/M_glTFRuntimeBase"));
 	if (OpaqueMaterial)
 	{
@@ -312,6 +373,9 @@ FglTFRuntimeParser::FglTFRuntimeParser(TSharedRef<FJsonObject> JsonObject, const
 	{
 		SpecularGlossinessMaterialsMap.Add(EglTFRuntimeMaterialType::TwoSidedTranslucent, SGTwoSidedTranslucentMaterial);
 	}
+
+	JsonObject->TryGetStringArrayField("extensionsUsed", ExtensionsUsed);
+	JsonObject->TryGetStringArrayField("extensionsRequired", ExtensionsRequired);
 }
 
 bool FglTFRuntimeParser::LoadNodes()
@@ -383,6 +447,26 @@ bool FglTFRuntimeParser::LoadNodesRecursive(const int32 NodeIndex, TArray<FglTFR
 	return true;
 }
 
+int32 FglTFRuntimeParser::GetNumMeshes() const
+{
+	const TArray<TSharedPtr<FJsonValue>>* JsonArray;
+	if (Root->TryGetArrayField("meshes", JsonArray))
+	{	
+		return JsonArray->Num();
+	}
+	return 0;
+}
+
+int32 FglTFRuntimeParser::GetNumImages() const
+{
+	const TArray<TSharedPtr<FJsonValue>>* JsonArray;
+	if (Root->TryGetArrayField("images", JsonArray))
+	{
+		return JsonArray->Num();
+	}
+	return 0;
+}
+
 bool FglTFRuntimeParser::LoadScenes(TArray<FglTFRuntimeScene>& Scenes)
 {
 	const TArray<TSharedPtr<FJsonValue>>* JsonScenes;
@@ -406,7 +490,9 @@ bool FglTFRuntimeParser::LoadScenes(TArray<FglTFRuntimeScene>& Scenes)
 bool FglTFRuntimeParser::CheckJsonIndex(TSharedRef<FJsonObject> JsonObject, const FString& FieldName, const int32 Index, TArray<TSharedRef<FJsonValue>>& JsonItems)
 {
 	if (Index < 0)
+	{
 		return false;
+	}
 
 	const TArray<TSharedPtr<FJsonValue>>* JsonArray;
 	if (!JsonObject->TryGetArrayField(FieldName, JsonArray))
@@ -438,10 +524,53 @@ TSharedPtr<FJsonObject> FglTFRuntimeParser::GetJsonObjectFromIndex(TSharedRef<FJ
 	return JsonArray[Index]->AsObject();
 }
 
+TSharedPtr<FJsonObject> FglTFRuntimeParser::GetJsonObjectFromExtensionIndex(TSharedRef<FJsonObject> JsonObject, const FString& ExtensionName, const FString& FieldName, const int32 Index)
+{
+	if (Index < 0)
+	{
+		return nullptr;
+	}
+
+	const TSharedPtr<FJsonObject>* JsonExtensionsObject;
+	if (!JsonObject->TryGetObjectField("extensions", JsonExtensionsObject))
+	{
+		return nullptr;
+	}
+
+	const TSharedPtr<FJsonObject>* JsonExtensionObject = nullptr;
+	if (!(*JsonExtensionsObject)->TryGetObjectField(ExtensionName, JsonExtensionObject))
+	{
+		return nullptr;
+	}
+
+	return GetJsonObjectFromIndex(JsonExtensionObject->ToSharedRef(), FieldName, Index);
+}
+
+
 FString FglTFRuntimeParser::GetJsonObjectString(TSharedRef<FJsonObject> JsonObject, const FString& FieldName, const FString& DefaultValue)
 {
 	FString Value;
 	if (!JsonObject->TryGetStringField(FieldName, Value))
+	{
+		return DefaultValue;
+	}
+	return Value;
+}
+
+double FglTFRuntimeParser::GetJsonObjectNumber(TSharedRef<FJsonObject> JsonObject, const FString& FieldName, const double DefaultValue)
+{
+	double Value;
+	if (!JsonObject->TryGetNumberField(FieldName, Value))
+	{
+		return DefaultValue;
+	}
+	return Value;
+}
+
+bool FglTFRuntimeParser::GetJsonObjectBool(TSharedRef<FJsonObject> JsonObject, const FString& FieldName, const bool DefaultValue)
+{
+	bool Value;
+	if (!JsonObject->TryGetBoolField(FieldName, Value))
 	{
 		return DefaultValue;
 	}
@@ -458,11 +587,64 @@ int32 FglTFRuntimeParser::GetJsonObjectIndex(TSharedRef<FJsonObject> JsonObject,
 	return (int32)Value;
 }
 
+int32 FglTFRuntimeParser::GetJsonExtensionObjectIndex(TSharedRef<FJsonObject> JsonObject, const FString& ExtensionName, const FString& FieldName, const int32 DefaultValue)
+{
+	const TSharedPtr<FJsonObject>* JsonExtensionsObject;
+	if (!JsonObject->TryGetObjectField("extensions", JsonExtensionsObject))
+	{
+		return false;
+	}
+
+	const TSharedPtr<FJsonObject>* JsonExtensionObject = nullptr;
+	if (!(*JsonExtensionObject)->TryGetObjectField(ExtensionName, JsonExtensionObject))
+	{
+		return false;
+	}
+
+	return GetJsonObjectIndex(JsonExtensionObject->ToSharedRef(), FieldName, DefaultValue);
+}
+
+TArray<int32> FglTFRuntimeParser::GetJsonExtensionObjectIndices(TSharedRef<FJsonObject> JsonObject, const FString& ExtensionName, const FString& FieldName)
+{
+	TArray<int32> Indices;
+	const TSharedPtr<FJsonObject>* JsonExtensionsObject;
+	if (!JsonObject->TryGetObjectField("extensions", JsonExtensionsObject))
+	{
+		return Indices;
+	}
+
+	const TSharedPtr<FJsonObject>* JsonExtensionObject = nullptr;
+	if (!(*JsonExtensionsObject)->TryGetObjectField(ExtensionName, JsonExtensionObject))
+	{
+		return Indices;
+	}
+
+	const TArray<TSharedPtr<FJsonValue>>* JsonArray;
+	if (!(*JsonExtensionObject)->TryGetArrayField(FieldName, JsonArray))
+	{
+		return Indices;
+	}
+
+	for (TSharedPtr<FJsonValue> JsonItem : *JsonArray)
+	{
+		int32 Index;
+		if (!JsonItem->TryGetNumber(Index))
+		{
+			return Indices;
+		}
+		Indices.Add(Index);
+	}
+
+	return Indices;
+}
+
 bool FglTFRuntimeParser::LoadScene(int32 SceneIndex, FglTFRuntimeScene& Scene)
 {
 	TSharedPtr<FJsonObject> JsonSceneObject = GetJsonObjectFromRootIndex("scenes", SceneIndex);
 	if (!JsonSceneObject)
+	{
 		return false;
+	}
 
 	Scene.Index = SceneIndex;
 	Scene.Name = GetJsonObjectString(JsonSceneObject.ToSharedRef(), "name", FString::FromInt(Scene.Index));
@@ -582,6 +764,8 @@ bool FglTFRuntimeParser::LoadNode_Internal(int32 Index, TSharedRef<FJsonObject> 
 	Node.SkinIndex = GetJsonObjectIndex(JsonNodeObject, "skin", INDEX_NONE);
 
 	Node.CameraIndex = GetJsonObjectIndex(JsonNodeObject, "camera", INDEX_NONE);
+
+	Node.EmitterIndices = GetJsonExtensionObjectIndices(JsonNodeObject, "MSFT_audio_emitter", "emitters");
 
 	FMatrix Matrix = FMatrix::Identity;
 
@@ -1135,7 +1319,13 @@ USkeleton* FglTFRuntimeParser::LoadSkeleton(const int32 SkinIndex, const FglTFRu
 	USkeletalMesh* SkeletalMesh = NewObject<USkeletalMesh>(GetTransientPackage(), NAME_None, RF_Public);
 	USkeleton* Skeleton = NewObject<USkeleton>(GetTransientPackage(), NAME_None, RF_Public);
 
-	if (!FillReferenceSkeleton(JsonSkinObject.ToSharedRef(), SkeletalMesh->RefSkeleton, BoneMap, SkeletonConfig))
+#if ENGINE_MAJOR_VERSION > 4 || ENGINE_MINOR_VERSION > 26
+	FReferenceSkeleton& RefSkeleton = SkeletalMesh->GetRefSkeleton();
+#else
+	FReferenceSkeleton& RefSkeleton = SkeletalMesh->RefSkeleton;
+#endif
+
+	if (!FillReferenceSkeleton(JsonSkinObject.ToSharedRef(), RefSkeleton, BoneMap, SkeletonConfig))
 	{
 		AddError("FillReferenceSkeleton()", "Unable to fill RefSkeleton.");
 		return nullptr;
@@ -1143,17 +1333,17 @@ USkeleton* FglTFRuntimeParser::LoadSkeleton(const int32 SkinIndex, const FglTFRu
 
 	if (SkeletonConfig.bNormalizeSkeletonScale)
 	{
-		NormalizeSkeletonScale(SkeletalMesh->RefSkeleton);
+		NormalizeSkeletonScale(RefSkeleton);
 	}
 
 	if (SkeletonConfig.bClearRotations || SkeletonConfig.CopyRotationsFrom)
 	{
-		ClearSkeletonRotations(SkeletalMesh->RefSkeleton);
+		ClearSkeletonRotations(RefSkeleton);
 	}
 
 	if (SkeletonConfig.CopyRotationsFrom)
 	{
-		CopySkeletonRotationsFrom(SkeletalMesh->RefSkeleton, SkeletonConfig.CopyRotationsFrom->GetReferenceSkeleton());
+		CopySkeletonRotationsFrom(RefSkeleton, SkeletonConfig.CopyRotationsFrom->GetReferenceSkeleton());
 	}
 
 	Skeleton->MergeAllBonesToBoneTree(SkeletalMesh);
@@ -1343,7 +1533,8 @@ bool FglTFRuntimeParser::FillReferenceSkeleton(TSharedRef<FJsonObject> JsonSkinO
 	{
 		TArray64<uint8> InverseBindMatricesBytes;
 		int64 ComponentType, Stride, Elements, ElementSize, Count;
-		if (!GetAccessor(inverseBindMatricesIndex, ComponentType, Stride, Elements, ElementSize, Count, InverseBindMatricesBytes))
+		bool bNormalized = false;
+		if (!GetAccessor(inverseBindMatricesIndex, ComponentType, Stride, Elements, ElementSize, Count, bNormalized, InverseBindMatricesBytes))
 		{
 			AddError("FillReferenceSkeleton()", FString::Printf(TEXT("Unable to load accessor: %lld."), inverseBindMatricesIndex));
 			return false;
@@ -1498,7 +1689,6 @@ bool FglTFRuntimeParser::LoadPrimitives(TSharedRef<FJsonObject> JsonMeshObject, 
 		const TArray<TSharedPtr<FJsonValue>>* JsonTargetNamesArray;
 		if ((*JsonExtrasObject)->TryGetArrayField("targetNames", JsonTargetNamesArray))
 		{
-			MorphTargetNameCount++;
 			auto ApplyTargetName = [FirstPrimitive, &Primitives](const int32 TargetNameIndex, const FString& TargetName)
 			{
 				int32 MorphTargetCounter = 0;
@@ -1519,14 +1709,7 @@ bool FglTFRuntimeParser::LoadPrimitives(TSharedRef<FJsonObject> JsonMeshObject, 
 			for (int32 TargetNameIndex = 0; TargetNameIndex < JsonTargetNamesArray->Num(); TargetNameIndex++)
 			{
 				const FString TargetName = (*JsonTargetNamesArray)[TargetNameIndex]->AsString();
-				if (MorphTargetNameCount == 2)
-				{
-					ApplyTargetName(TargetNameIndex, TargetName + "_Teeth");
-				}
-				else
-				{
-					ApplyTargetName(TargetNameIndex, TargetName);
-				}
+				ApplyTargetName(TargetNameIndex, TargetName);
 			}
 		}
 	}
@@ -1575,6 +1758,8 @@ bool FglTFRuntimeParser::LoadPrimitives(TSharedRef<FJsonObject> JsonMeshObject, 
 
 bool FglTFRuntimeParser::LoadPrimitive(TSharedRef<FJsonObject> JsonPrimitiveObject, FglTFRuntimePrimitive& Primitive, const FglTFRuntimeMaterialsConfig& MaterialsConfig)
 {
+	SCOPED_NAMED_EVENT(FglTFRuntimeParser_LoadPrimitive, FColor::Magenta);
+
 	const TSharedPtr<FJsonObject>* JsonAttributesObject;
 	if (!JsonPrimitiveObject->TryGetObjectField("attributes", JsonAttributesObject))
 	{
@@ -1589,8 +1774,22 @@ bool FglTFRuntimeParser::LoadPrimitive(TSharedRef<FJsonObject> JsonPrimitiveObje
 		return false;
 	}
 
+	const bool bHasMeshQuantization = ExtensionsRequired.Contains("KHR_mesh_quantization");
+
+	TArray<int64> SupportedPositionComponentTypes = { 5126 };
+	TArray<int64> SupportedNormalComponentTypes = { 5126 };
+	TArray<int64> SupportedTangentComponentTypes = { 5126 };
+	TArray<int64> SupportedTexCoordComponentTypes = { 5126, 5121, 5123 };
+	if (bHasMeshQuantization)
+	{
+		SupportedPositionComponentTypes.Append({ 5120, 5121, 5122, 5123 });
+		SupportedNormalComponentTypes.Append({ 5120, 5122 });
+		SupportedTangentComponentTypes.Append({ 5120, 5122 });
+		SupportedTexCoordComponentTypes.Append({ 5120, 5122 });
+	}
+
 	if (!BuildFromAccessorField(JsonAttributesObject->ToSharedRef(), "POSITION", Primitive.Positions,
-		{ 3 }, { 5126 }, false, [&](FVector Value) -> FVector {return SceneBasis.TransformPosition(Value) * SceneScale; }))
+		{ 3 }, SupportedPositionComponentTypes, false, [&](FVector Value) -> FVector {return SceneBasis.TransformPosition(Value) * SceneScale; }))
 	{
 		AddError("LoadPrimitive()", "Unable to load POSITION attribute");
 		return false;
@@ -1599,7 +1798,7 @@ bool FglTFRuntimeParser::LoadPrimitive(TSharedRef<FJsonObject> JsonPrimitiveObje
 	if ((*JsonAttributesObject)->HasField("NORMAL"))
 	{
 		if (!BuildFromAccessorField(JsonAttributesObject->ToSharedRef(), "NORMAL", Primitive.Normals,
-			{ 3 }, { 5126 }, false, [&](FVector Value) -> FVector { return SceneBasis.TransformVector(Value); }))
+			{ 3 }, SupportedNormalComponentTypes, false, [&](FVector Value) -> FVector { return SceneBasis.TransformVector(Value); }))
 		{
 			AddError("LoadPrimitive()", "Unable to load NORMAL attribute");
 			return false;
@@ -1609,7 +1808,7 @@ bool FglTFRuntimeParser::LoadPrimitive(TSharedRef<FJsonObject> JsonPrimitiveObje
 	if ((*JsonAttributesObject)->HasField("TANGENT"))
 	{
 		if (!BuildFromAccessorField(JsonAttributesObject->ToSharedRef(), "TANGENT", Primitive.Tangents,
-			{ 4 }, { 5126 }, false, [&](FVector4 Value) -> FVector4 { return SceneBasis.TransformVector(Value); }))
+			{ 4 }, SupportedTangentComponentTypes, false, [&](FVector4 Value) -> FVector4 { return SceneBasis.TransformFVector4(Value); }))
 		{
 			AddError("LoadPrimitive()", "Unable to load TANGENT attribute");
 			return false;
@@ -1620,7 +1819,7 @@ bool FglTFRuntimeParser::LoadPrimitive(TSharedRef<FJsonObject> JsonPrimitiveObje
 	{
 		TArray<FVector2D> UV;
 		if (!BuildFromAccessorField(JsonAttributesObject->ToSharedRef(), "TEXCOORD_0", UV,
-			{ 2 }, { 5126, 5121, 5123 }, true, [&](FVector2D Value) -> FVector2D {return FVector2D(Value.X, Value.Y); }))
+			{ 2 }, SupportedTexCoordComponentTypes, true, [&](FVector2D Value) -> FVector2D {return FVector2D(Value.X, Value.Y); }))
 		{
 			AddError("LoadPrimitive()", "Error loading TEXCOORD_0");
 			return false;
@@ -1633,7 +1832,7 @@ bool FglTFRuntimeParser::LoadPrimitive(TSharedRef<FJsonObject> JsonPrimitiveObje
 	{
 		TArray<FVector2D> UV;
 		if (!BuildFromAccessorField(JsonAttributesObject->ToSharedRef(), "TEXCOORD_1", UV,
-			{ 2 }, { 5126, 5121, 5123 }, true, [&](FVector2D Value) -> FVector2D {return FVector2D(Value.X, Value.Y); }))
+			{ 2 }, SupportedTexCoordComponentTypes, true, [&](FVector2D Value) -> FVector2D {return FVector2D(Value.X, Value.Y); }))
 		{
 			AddError("LoadPrimitive()", "Error loading TEXCOORD_1");
 			return false;
@@ -1762,7 +1961,8 @@ bool FglTFRuntimeParser::LoadPrimitive(TSharedRef<FJsonObject> JsonPrimitiveObje
 	{
 		TArray64<uint8> IndicesBytes;
 		int64 ComponentType, Stride, Elements, ElementSize, Count;
-		if (!GetAccessor(IndicesAccessorIndex, ComponentType, Stride, Elements, ElementSize, Count, IndicesBytes))
+		bool bNormalized = false;
+		if (!GetAccessor(IndicesAccessorIndex, ComponentType, Stride, Elements, ElementSize, Count, bNormalized, IndicesBytes))
 		{
 			AddError("LoadPrimitive()", FString::Printf(TEXT("Unable to load accessor: %lld"), IndicesAccessorIndex));
 			return false;
@@ -1815,14 +2015,41 @@ bool FglTFRuntimeParser::LoadPrimitive(TSharedRef<FJsonObject> JsonPrimitiveObje
 		}
 	}
 
+	// Draco decompression
+	const TSharedPtr<FJsonObject>* JsonExtensions;
+	if (JsonPrimitiveObject->TryGetObjectField("extensions", JsonExtensions))
+	{
+		// KHR_draco_mesh_compression
+		const TSharedPtr<FJsonObject>* KHR_draco_mesh_compression;
+		if ((*JsonExtensions)->TryGetObjectField("KHR_draco_mesh_compression", KHR_draco_mesh_compression))
+		{
+			int64 BufferView;
+			if (!(*KHR_draco_mesh_compression)->TryGetNumberField("bufferView", BufferView))
+			{
+				AddError("LoadPrimitive()", "KHR_draco_mesh_compression requires a valid bufferView");
+				return false;
+			}
+
+			TArray64<uint8> DracoData;
+			int64 Stride;
+			if (!GetBufferView(BufferView, DracoData, Stride))
+			{
+				AddError("LoadPrimitive()", "KHR_draco_mesh_compression has an invalid bufferView");
+				return false;
+			}
+
+			AddError("LoadPrimitive()", "KHR_draco_mesh_compression extension is currently not supported");
+			return false;
+		}
+	}
 
 	int64 MaterialIndex;
 	if (JsonPrimitiveObject->TryGetNumberField("material", MaterialIndex))
 	{
-		Primitive.Material = LoadMaterial(MaterialIndex, MaterialsConfig, Primitive.Colors.Num() > 0);
+		Primitive.Material = LoadMaterial(MaterialIndex, MaterialsConfig, Primitive.Colors.Num() > 0, Primitive.MaterialName);
 		if (!Primitive.Material)
 		{
-			AddError("LoadMaterial()", FString::Printf(TEXT("Unable to load material %lld"), MaterialIndex));
+			AddError("LoadPrimitive()", FString::Printf(TEXT("Unable to load material %lld"), MaterialIndex));
 			return false;
 		}
 	}
@@ -1876,7 +2103,9 @@ bool FglTFRuntimeParser::GetBuffer(int32 Index, TArray64<uint8>& Bytes)
 
 	FString Uri;
 	if (!JsonBufferObject->TryGetStringField("uri", Uri))
+	{
 		return false;
+	}
 
 	// check it is a valid base64 data uri
 	if (Uri.StartsWith("data:"))
@@ -1886,20 +2115,29 @@ bool FglTFRuntimeParser::GetBuffer(int32 Index, TArray64<uint8>& Bytes)
 			BuffersCache.Add(Index, Bytes);
 			return true;
 		}
+		return false;
 	}
-	else if (!BaseDirectory.IsEmpty())
+
+	if (ZipFile)
+	{
+		if (ZipFile->GetFileContent(Uri, Bytes))
+		{
+			BuffersCache.Add(Index, Bytes);
+			return true;
+		}
+	}
+
+	// fallback
+	if (!BaseDirectory.IsEmpty())
 	{
 		if (FFileHelper::LoadFileToArray(Bytes, *FPaths::Combine(BaseDirectory, Uri)))
 		{
 			BuffersCache.Add(Index, Bytes);
 			return true;
 		}
-		else
-		{
-			AddError("GetBuffer()", FString::Printf(TEXT("Unable to load buffer %d from file %s"), Index, *Uri));
-		}
 	}
 
+	AddError("GetBuffer()", FString::Printf(TEXT("Unable to load buffer %d from Uri %s (you may want to enable external files loading...)"), Index, *Uri));
 	return false;
 }
 
@@ -1989,7 +2227,7 @@ bool FglTFRuntimeParser::GetBufferView(int32 Index, TArray64<uint8>& Bytes, int6
 	return true;
 }
 
-bool FglTFRuntimeParser::GetAccessor(int32 Index, int64& ComponentType, int64& Stride, int64& Elements, int64& ElementSize, int64& Count, TArray64<uint8>& Bytes)
+bool FglTFRuntimeParser::GetAccessor(int32 Index, int64& ComponentType, int64& Stride, int64& Elements, int64& ElementSize, int64& Count, bool& bNormalized, TArray64<uint8>& Bytes)
 {
 
 	TSharedPtr<FJsonObject> JsonAccessorObject = GetJsonObjectFromRootIndex("accessors", Index);
@@ -2017,6 +2255,11 @@ bool FglTFRuntimeParser::GetAccessor(int32 Index, int64& ComponentType, int64& S
 	if (!JsonAccessorObject->TryGetNumberField("byteOffset", ByteOffset))
 	{
 		ByteOffset = 0;
+	}
+
+	if (!JsonAccessorObject->TryGetBoolField("normalized", bNormalized))
+	{
+		bNormalized = false;
 	}
 
 	if (!JsonAccessorObject->TryGetNumberField("componentType", ComponentType))
@@ -2054,6 +2297,7 @@ bool FglTFRuntimeParser::GetAccessor(int32 Index, int64& ComponentType, int64& S
 		Bytes.AddZeroed(FinalSize);
 		if (!bHasSparse)
 		{
+			Stride = ElementSize * Elements;
 			return true;
 		}
 	}
@@ -2465,4 +2709,240 @@ bool FglTFRuntimeParser::GetMorphTargetNames(const int32 MeshIndex, TArray<FName
 
 	return true;
 }
-#pragma optimize("", on)
+
+bool FglTFRuntimeZipFile::FromData(const uint8* DataPtr, const int64 DataNum)
+{
+	Data.Append(DataPtr, DataNum);
+
+	// step0: retrieve the trailer magic
+	TArray<uint8> Magic;
+	bool bIndexFound = false;
+	uint64 Index = 0;
+	for (Index = Data.Num() - 1; Index >= 0; Index--)
+	{
+		Magic.Insert(Data[Index], 0);
+		if (Magic.Num() == 4)
+		{
+			if (Magic[0] == 0x50 && Magic[1] == 0x4b && Magic[2] == 0x05 && Magic[3] == 0x06)
+			{
+				bIndexFound = true;
+				break;
+			}
+			Magic.Pop();
+		}
+	}
+
+	if (!bIndexFound)
+	{
+		return false;
+	}
+
+	uint16 DiskEntries = 0;
+	uint16 TotalEntries = 0;
+	uint32 CentralDirectorySize = 0;
+	uint32 CentralDirectoryOffset = 0;
+	uint16 CommentLen = 0;
+
+	constexpr uint64 TrailerMinSize = 22;
+	constexpr uint64 CentralDirectoryMinSize = 46;
+
+	if (Index + TrailerMinSize > Data.Num())
+	{
+		return false;
+	}
+
+	// skip signature and disk data
+	Data.Seek(Index + 8);
+	Data << DiskEntries;
+	Data << TotalEntries;
+	Data << CentralDirectorySize;
+	Data << CentralDirectoryOffset;
+	Data << CommentLen;
+
+	uint16 DirectoryEntries = FMath::Min(DiskEntries, TotalEntries);
+
+	for (uint16 DirectoryIndex = 0; DirectoryIndex < DirectoryEntries; DirectoryIndex++)
+	{
+		if (CentralDirectoryOffset + CentralDirectoryMinSize > Data.Num())
+		{
+			return false;
+		}
+
+		uint16 FilenameLen = 0;
+		uint16 ExtraFieldLen = 0;
+		uint16 EntryCommentLen = 0;
+		uint32 EntryOffset = 0;
+
+		// seek to FilenameLen
+		Data.Seek(CentralDirectoryOffset + 28);
+		Data << FilenameLen;
+		Data << ExtraFieldLen;
+		Data << EntryCommentLen;
+		// seek to EntryOffset
+		Data.Seek(CentralDirectoryOffset + 42);
+		Data << EntryOffset;
+
+		if (CentralDirectoryOffset + CentralDirectoryMinSize + FilenameLen + ExtraFieldLen + EntryCommentLen > Data.Num())
+		{
+			return false;
+		}
+
+		TArray64<uint8> FilenameBytes;
+		FilenameBytes.Append(Data.GetData() + CentralDirectoryOffset + CentralDirectoryMinSize, FilenameLen);
+		FilenameBytes.Add(0);
+
+		FString Filename = FString(UTF8_TO_TCHAR(FilenameBytes.GetData()));
+
+		OffsetsMap.Add(Filename, EntryOffset);
+
+		CentralDirectoryOffset += CentralDirectoryMinSize + FilenameLen + ExtraFieldLen + EntryCommentLen;
+	}
+
+	return true;
+}
+
+bool FglTFRuntimeZipFile::GetFileContent(const FString& Filename, TArray64<uint8>& OutData)
+{
+	uint32* Offset = OffsetsMap.Find(Filename);
+	if (!Offset)
+	{
+		return false;
+	}
+
+	constexpr uint64 LocalEntryMinSize = 30;
+
+	if (*Offset + LocalEntryMinSize > Data.Num())
+	{
+		return false;
+	}
+
+	uint16 Compression = 0;
+	uint32 CompressedSize;
+	uint32 UncompressedSize = 0;
+	uint16 FilenameLen = 0;
+	uint16 ExtraFieldLen = 0;
+
+	// seek to Compression
+	Data.Seek(*Offset + 8);
+	Data << Compression;
+	// seek to CompressedSize
+	Data.Seek(*Offset + 18);
+	Data << CompressedSize;
+	Data << UncompressedSize;
+	Data << FilenameLen;
+	Data << ExtraFieldLen;
+
+	if (*Offset + LocalEntryMinSize + FilenameLen + ExtraFieldLen + CompressedSize > Data.Num())
+	{
+		return false;
+	}
+
+	if (Compression == 8)
+	{
+		OutData.AddUninitialized(UncompressedSize);
+		if (!FCompression::UncompressMemory(NAME_Zlib, OutData.GetData(), UncompressedSize, Data.GetData() + *Offset + LocalEntryMinSize + FilenameLen + ExtraFieldLen, CompressedSize, COMPRESS_NoFlags, -15))
+		{
+			return false;
+		}
+	}
+	else if (Compression == 0 && CompressedSize == UncompressedSize)
+	{
+		OutData.Append(Data.GetData() + *Offset + LocalEntryMinSize + FilenameLen + ExtraFieldLen, UncompressedSize);
+	}
+	else
+	{
+		return false;
+	}
+
+	return true;
+}
+
+bool FglTFRuntimeZipFile::FileExists(const FString& Filename) const
+{
+	return OffsetsMap.Contains(Filename);
+}
+
+FString FglTFRuntimeZipFile::GetFirstFilenameByExtension(const FString& Extension) const
+{
+	for (const TPair<FString, uint32>& Pair : OffsetsMap)
+	{
+		if (Pair.Key.EndsWith(Extension, ESearchCase::IgnoreCase))
+		{
+			return Pair.Key;
+		}
+	}
+
+	return "";
+}
+
+bool FglTFRuntimeParser::GetJsonObjectBytes(TSharedRef<FJsonObject> JsonObject, TArray64<uint8>& Bytes)
+{
+	FString Uri;
+	if (JsonObject->TryGetStringField("uri", Uri))
+	{
+		// check it is a valid base64 data uri
+		if (Uri.StartsWith("data:"))
+		{
+			if (!ParseBase64Uri(Uri, Bytes))
+			{
+				return false;
+			}
+		}
+		else
+		{
+			bool bFound = false;
+			if (ZipFile)
+			{
+				if (ZipFile->GetFileContent(Uri, Bytes))
+				{
+					bFound = true;
+				}
+			}
+
+			if (!bFound && !BaseDirectory.IsEmpty())
+			{
+				if (!FFileHelper::LoadFileToArray(Bytes, *FPaths::Combine(BaseDirectory, Uri)))
+				{
+					AddError("GetJsonObjectBytes()", FString::Printf(TEXT("Unable to load bytes from uri %s"), *Uri));
+					return false;
+				}
+				bFound = true;
+			}
+
+			if (!bFound)
+			{
+				AddError("GetJsonObjectBytes()", FString::Printf(TEXT("Unable to open uri %s, you may want to enable external files loading..."), *Uri));
+				return false;
+			}
+		}
+	}
+	else
+	{
+		int64 BufferViewIndex;
+		if (JsonObject->TryGetNumberField("bufferView", BufferViewIndex))
+		{
+			int64 Stride;
+			if (!GetBufferView(BufferViewIndex, Bytes, Stride))
+			{
+				AddError("GetJsonObjectBytes()", FString::Printf(TEXT("Unable to get bufferView: %d"), BufferViewIndex));
+				return false;
+			}
+		}
+	}
+
+	return Bytes.Num() > 0;
+}
+
+FVector FglTFRuntimeParser::ComputeTangentY(const FVector Normal, const FVector TangetX)
+{
+	float Determinant = GetBasisDeterminantSign(Normal.GetSafeNormal(),
+		(Normal ^ TangetX).GetSafeNormal(),
+		Normal.GetSafeNormal());
+
+	return (Normal ^ TangetX) * Determinant;
+}
+
+FVector FglTFRuntimeParser::ComputeTangentYWithW(const FVector Normal, const FVector TangetX, const float W)
+{
+	return (Normal ^ TangetX) * W;
+}

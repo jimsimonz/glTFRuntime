@@ -1,8 +1,9 @@
-// Copyright 2020, Roberto De Ioris.
+// Copyright 2022, Roberto De Ioris.
 
 
 #include "glTFRuntimeFunctionLibrary.h"
 #include "HttpModule.h"
+#include "HAL/PlatformApplicationMisc.h"
 #include "Interfaces/IHttpRequest.h"
 #include "Interfaces/IHttpResponse.h"
 
@@ -13,6 +14,9 @@ UglTFRuntimeAsset* UglTFRuntimeFunctionLibrary::glTFLoadAssetFromFilename(const 
 	{
 		return nullptr;
 	}
+
+	Asset->RuntimeContextObject = LoaderConfig.RuntimeContextObject;
+	Asset->RuntimeContextString = LoaderConfig.RuntimeContextString;
 
 	// Annoying copy, but we do not want to remove the const
 	FglTFRuntimeConfig OverrideConfig = LoaderConfig;
@@ -34,14 +38,22 @@ UglTFRuntimeAsset* UglTFRuntimeFunctionLibrary::glTFLoadAssetFromString(const FS
 {
 	UglTFRuntimeAsset* Asset = NewObject<UglTFRuntimeAsset>();
 	if (!Asset)
+	{
 		return nullptr;
+	}
+
+	Asset->RuntimeContextObject = LoaderConfig.RuntimeContextObject;
+	Asset->RuntimeContextString = LoaderConfig.RuntimeContextString;
+
 	if (!Asset->LoadFromString(JsonData, LoaderConfig))
+	{
 		return nullptr;
+	}
 
 	return Asset;
 }
 
-void UglTFRuntimeFunctionLibrary::glTFLoadAssetFromUrl(const FString& Url, TMap<FString, FString>& Headers, FglTFRuntimeHttpResponse Completed, const FglTFRuntimeConfig& LoaderConfig)
+void UglTFRuntimeFunctionLibrary::glTFLoadAssetFromUrl(const FString& Url, const TMap<FString, FString>& Headers, FglTFRuntimeHttpResponse Completed, const FglTFRuntimeConfig& LoaderConfig)
 {
 #if ENGINE_MAJOR_VERSION > 4 || ENGINE_MINOR_VERSION > 25
 	TSharedRef<IHttpRequest, ESPMode::ThreadSafe> HttpRequest = FHttpModule::Get().CreateRequest();
@@ -75,10 +87,46 @@ UglTFRuntimeAsset* UglTFRuntimeFunctionLibrary::glTFLoadAssetFromData(const TArr
 		return nullptr;
 	}
 
+	Asset->RuntimeContextObject = LoaderConfig.RuntimeContextObject;
+	Asset->RuntimeContextString = LoaderConfig.RuntimeContextString;
+
 	if (!Asset->LoadFromData(Data.GetData(), Data.Num(), LoaderConfig))
 	{
 		return nullptr;
 	}
 
 	return Asset;
+}
+
+bool UglTFRuntimeFunctionLibrary::glTFLoadAssetFromClipboard(FglTFRuntimeHttpResponse Completed, const FglTFRuntimeConfig& LoaderConfig)
+{
+
+	FString Url;
+	FPlatformApplicationMisc::ClipboardPaste(Url);
+
+	if (Url.IsEmpty())
+	{
+		return false;
+	}
+
+	// escaped?
+	if (Url.StartsWith("\"") && Url.EndsWith("\""))
+	{
+		Url = Url.RightChop(1).LeftChop(1);
+	}
+
+	if (Url.Contains("://"))
+	{
+		glTFLoadAssetFromUrl(Url, {}, Completed, LoaderConfig);
+		return true;
+	}
+
+	UglTFRuntimeAsset* Asset = glTFLoadAssetFromFilename(Url, false, LoaderConfig);
+	if (Asset)
+	{
+		Completed.ExecuteIfBound(Asset);
+		return true;
+	}
+
+	return false;
 }

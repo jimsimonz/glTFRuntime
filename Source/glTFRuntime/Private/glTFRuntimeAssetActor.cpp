@@ -14,6 +14,10 @@ AglTFRuntimeAssetActor::AglTFRuntimeAssetActor()
 
 	AssetRoot = CreateDefaultSubobject<USceneComponent>(TEXT("AssetRoot"));
 	RootComponent = AssetRoot;
+	bAllowNodeAnimations = true;
+	bStaticMeshesAsSkeletal = false;
+	bAllowSkeletalAnimations = true;
+	bAllowPoseAnimations = true;
 }
 
 // Called when the game starts or when spawned
@@ -25,6 +29,8 @@ void AglTFRuntimeAssetActor::BeginPlay()
 	{
 		return;
 	}
+
+	double LoadingStartTime = FPlatformTime::Seconds();
 
 	TArray<FglTFRuntimeScene> Scenes = Asset->GetScenes();
 	for (FglTFRuntimeScene& Scene : Scenes)
@@ -40,16 +46,41 @@ void AglTFRuntimeAssetActor::BeginPlay()
 			{
 				return;
 			}
-			ProcessNode(SceneComponent, Node);
+			ProcessNode(SceneComponent, NAME_None, Node);
 		}
 	}
+
+	for (TPair<USceneComponent*, FName>& Pair : SocketMapping)
+	{
+		for (USkeletalMeshComponent* SkeletalMeshComponent : DiscoveredSkeletalMeshComponents)
+		{
+			if (SkeletalMeshComponent->DoesSocketExist(Pair.Value))
+			{
+				Pair.Key->AttachToComponent(SkeletalMeshComponent, FAttachmentTransformRules::KeepRelativeTransform, Pair.Value);
+				Pair.Key->SetRelativeTransform(FTransform::Identity);
+				CurveBasedAnimations.Remove(Pair.Key);
+				break;
+			}
+		}
+	}
+
+	UE_LOG(LogGLTFRuntime, Log, TEXT("Asset loaded in %f seconds"), FPlatformTime::Seconds() - LoadingStartTime);
 }
 
-void AglTFRuntimeAssetActor::ProcessNode(USceneComponent* NodeParentComponent, FglTFRuntimeNode& Node)
+void AglTFRuntimeAssetActor::ProcessNode(USceneComponent* NodeParentComponent, const FName SocketName, FglTFRuntimeNode& Node)
 {
-	// skip bones/joints
+	// special case for bones/joints
 	if (Asset->NodeIsBone(Node.Index))
 	{
+		for (int32 ChildIndex : Node.ChildrenIndices)
+		{
+			FglTFRuntimeNode Child;
+			if (!Asset->GetNode(ChildIndex, Child))
+			{
+				return;
+			}
+			ProcessNode(NodeParentComponent, *Child.Name, Child);
+		}
 		return;
 	}
 
@@ -75,7 +106,7 @@ void AglTFRuntimeAssetActor::ProcessNode(USceneComponent* NodeParentComponent, F
 	}
 	else
 	{
-		if (Node.SkinIndex < 0)
+		if (Node.SkinIndex < 0 && !bStaticMeshesAsSkeletal)
 		{
 			UStaticMeshComponent* StaticMeshComponent = NewObject<UStaticMeshComponent>(this, GetSafeNodeName<UStaticMeshComponent>(Node));
 			StaticMeshComponent->SetupAttachment(NodeParentComponent);
@@ -112,6 +143,7 @@ void AglTFRuntimeAssetActor::ProcessNode(USceneComponent* NodeParentComponent, F
 			AddInstanceComponent(SkeletalMeshComponent);
 			USkeletalMesh* SkeletalMesh = Asset->LoadSkeletalMesh(Node.MeshIndex, Node.SkinIndex, SkeletalMeshConfig);
 			SkeletalMeshComponent->SetSkeletalMesh(SkeletalMesh);
+			DiscoveredSkeletalMeshComponents.Add(SkeletalMeshComponent);
 			ReceiveOnSkeletalMeshComponentCreated(SkeletalMeshComponent, Node);
 			NewComponent = SkeletalMeshComponent;
 		}
@@ -120,6 +152,16 @@ void AglTFRuntimeAssetActor::ProcessNode(USceneComponent* NodeParentComponent, F
 	if (!NewComponent)
 	{
 		return;
+	}
+	else
+	{
+		NewComponent->ComponentTags.Add(*FString::Printf(TEXT("GLTFRuntime:NodeName:%s"), *Node.Name));
+		NewComponent->ComponentTags.Add(*FString::Printf(TEXT("GLTFRuntime:NodeIndex:%d"), Node.Index));
+
+		if (SocketName != NAME_None)
+		{
+			SocketMapping.Add(NewComponent, SocketName);
+		}
 	}
 
 	// check for audio emitters
@@ -141,31 +183,41 @@ void AglTFRuntimeAssetActor::ProcessNode(USceneComponent* NodeParentComponent, F
 	// check for animations
 	if (!NewComponent->IsA<USkeletalMeshComponent>())
 	{
-		TArray<UglTFRuntimeAnimationCurve*> ComponentAnimationCurves = Asset->LoadAllNodeAnimationCurves(Node.Index);
-		TMap<FString, UglTFRuntimeAnimationCurve*> ComponentAnimationCurvesMap;
-		for (UglTFRuntimeAnimationCurve* ComponentAnimationCurve : ComponentAnimationCurves)
+		if (bAllowNodeAnimations)
 		{
-			if (!CurveBasedAnimations.Contains(NewComponent))
+			TArray<UglTFRuntimeAnimationCurve*> ComponentAnimationCurves = Asset->LoadAllNodeAnimationCurves(Node.Index);
+			TMap<FString, UglTFRuntimeAnimationCurve*> ComponentAnimationCurvesMap;
+			for (UglTFRuntimeAnimationCurve* ComponentAnimationCurve : ComponentAnimationCurves)
 			{
-				CurveBasedAnimations.Add(NewComponent, ComponentAnimationCurve);
-				CurveBasedAnimationsTimeTracker.Add(NewComponent, 0);
+				if (!CurveBasedAnimations.Contains(NewComponent))
+				{
+					CurveBasedAnimations.Add(NewComponent, ComponentAnimationCurve);
+					CurveBasedAnimationsTimeTracker.Add(NewComponent, 0);
+				}
+				DiscoveredCurveAnimationsNames.Add(ComponentAnimationCurve->glTFCurveAnimationName);
+				ComponentAnimationCurvesMap.Add(ComponentAnimationCurve->glTFCurveAnimationName, ComponentAnimationCurve);
 			}
-			DiscoveredCurveAnimationsNames.Add(ComponentAnimationCurve->glTFCurveAnimationName);
-			ComponentAnimationCurvesMap.Add(ComponentAnimationCurve->glTFCurveAnimationName, ComponentAnimationCurve);
+			DiscoveredCurveAnimations.Add(NewComponent, ComponentAnimationCurvesMap);
 		}
-		DiscoveredCurveAnimations.Add(NewComponent, ComponentAnimationCurvesMap);
 	}
 	else
 	{
 		USkeletalMeshComponent* SkeletalMeshComponent = Cast<USkeletalMeshComponent>(NewComponent);
-		FglTFRuntimeSkeletalAnimationConfig SkeletalAnimationConfig;
-		UAnimSequence* SkeletalAnimation = Asset->LoadNodeSkeletalAnimation(SkeletalMeshComponent->SkeletalMesh, Node.Index, SkeletalAnimationConfig);
-		if (SkeletalAnimation)
+		if (bAllowSkeletalAnimations)
 		{
-			SkeletalMeshComponent->AnimationData.AnimToPlay = SkeletalAnimation;
-			SkeletalMeshComponent->AnimationData.bSavedLooping = true;
-			SkeletalMeshComponent->AnimationData.bSavedPlaying = true;
-			SkeletalMeshComponent->SetAnimationMode(EAnimationMode::AnimationSingleNode);
+			FglTFRuntimeSkeletalAnimationConfig SkeletalAnimationConfig;
+			UAnimSequence* SkeletalAnimation = Asset->LoadNodeSkeletalAnimation(SkeletalMeshComponent->SkeletalMesh, Node.Index, SkeletalAnimationConfig);
+			if (!SkeletalAnimation && bAllowPoseAnimations)
+			{
+				SkeletalAnimation = Asset->CreateAnimationFromPose(SkeletalMeshComponent->SkeletalMesh, SkeletalAnimationConfig);
+			}
+			if (SkeletalAnimation)
+			{
+				SkeletalMeshComponent->AnimationData.AnimToPlay = SkeletalAnimation;
+				SkeletalMeshComponent->AnimationData.bSavedLooping = true;
+				SkeletalMeshComponent->AnimationData.bSavedPlaying = true;
+				SkeletalMeshComponent->SetAnimationMode(EAnimationMode::AnimationSingleNode);
+			}
 		}
 	}
 
@@ -176,7 +228,7 @@ void AglTFRuntimeAssetActor::ProcessNode(USceneComponent* NodeParentComponent, F
 		{
 			return;
 		}
-		ProcessNode(NewComponent, Child);
+		ProcessNode(NewComponent, NAME_None, Child);
 	}
 }
 

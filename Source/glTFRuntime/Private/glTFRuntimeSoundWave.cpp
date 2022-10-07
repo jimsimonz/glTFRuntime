@@ -1,4 +1,4 @@
-// Copyright 2020-2021, Roberto De Ioris.
+// Copyright 2020-2022, Roberto De Ioris.
 
 
 #include "glTFRuntimeSoundWave.h"
@@ -9,7 +9,7 @@ UglTFRuntimeSoundWave::UglTFRuntimeSoundWave()
 	RuntimeAudioOffset = 0;
 }
 
-int32 UglTFRuntimeSoundWave::GeneratePCMData(uint8* PCMData, const int32 SamplesNeeded, const int32 ClockPositionInFrames)
+int32 UglTFRuntimeSoundWave::GeneratePCMData(uint8* PCMData, const int32 SamplesNeeded)
 {
 	if (RuntimeAudioData.Num() == 0)
 	{

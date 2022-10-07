@@ -1,4 +1,4 @@
-// Copyright 2020-2021, Roberto De Ioris.
+// Copyright 2020-2022, Roberto De Ioris.
 
 #pragma once
 
@@ -17,7 +17,7 @@ class GLTFRUNTIME_API UglTFRuntimeSoundWave : public USoundWave
 public:
 	UglTFRuntimeSoundWave();
 
-	virtual int32 GeneratePCMData(uint8* PCMData, const int32 SamplesNeeded, const int32 ClockPositionInFrames) override;
+	virtual int32 GeneratePCMData(uint8* PCMData, const int32 SamplesNeeded) override;
 	virtual bool HasCompressedData(FName Format, ITargetPlatform* TargetPlatform) const override { return false; }
 
 	virtual void SetRuntimeAudioData(const uint8* AudioData, const int64 AudioDataSize)

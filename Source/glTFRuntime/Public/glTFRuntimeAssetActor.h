@@ -20,7 +20,7 @@ protected:
 	// Called when the game starts or when spawned
 	virtual void BeginPlay() override;
 
-	virtual void ProcessNode(USceneComponent* NodeParentComponent, FglTFRuntimeNode& Node);
+	virtual void ProcessNode(USceneComponent* NodeParentComponent, const FName SocketName, FglTFRuntimeNode& Node);
 
 	TMap<USceneComponent*, float>  CurveBasedAnimationsTimeTracker;
 
@@ -34,6 +34,9 @@ protected:
 	{
 		return MakeUniqueObjectName(this, T::StaticClass(), *Node.Name);
 	}
+
+	TMap<USceneComponent*, FName> SocketMapping;
+	TArray<USkeletalMeshComponent*> DiscoveredSkeletalMeshComponents;
 
 public:	
 	// Called every frame
@@ -60,8 +63,19 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "glTFRuntime")
 	void SetCurveAnimationByName(const FString& CurveAnimationName);
 
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Meta = (ExposeOnSpawn = true), Category = "glTFRuntime")
+	bool bAllowNodeAnimations;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Meta = (ExposeOnSpawn = true), Category = "glTFRuntime")
+	bool bStaticMeshesAsSkeletal;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Meta = (ExposeOnSpawn = true), Category = "glTFRuntime")
+	bool bAllowSkeletalAnimations;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Meta = (ExposeOnSpawn = true), Category = "glTFRuntime")
+	bool bAllowPoseAnimations;
+
 private:
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, meta = (AllowPrivateAccess = "true"), Category="glTFRuntime")
 	USceneComponent* AssetRoot;
-
 };

@@ -17,6 +17,7 @@ FglTFRuntimeOnLoadedRefSkeleton FglTFRuntimeParser::OnLoadedRefSkeleton;
 FglTFRuntimeOnCreatedPoseTracks FglTFRuntimeParser::OnCreatedPoseTracks;
 FglTFRuntimeOnTexturePixels FglTFRuntimeParser::OnTexturePixels;
 FglTFRuntimeOnLoadedTexturePixels FglTFRuntimeParser::OnLoadedTexturePixels;
+FglTFRuntimeOnFinalizedStaticMesh FglTFRuntimeParser::OnFinalizedStaticMesh;
 
 TSharedPtr<FglTFRuntimeParser> FglTFRuntimeParser::FromFilename(const FString& Filename, const FglTFRuntimeConfig& LoaderConfig)
 {
@@ -205,6 +206,16 @@ TSharedPtr<FglTFRuntimeParser> FglTFRuntimeParser::FromData(const uint8* DataPtr
 			DataPtr = UnzippedData.GetData();
 			DataNum = UnzippedData.Num();
 		}
+	}
+
+	if (LoaderConfig.bAsBlob)
+	{
+		TSharedPtr<FglTFRuntimeParser> NewParser = MakeShared<FglTFRuntimeParser>(MakeShared<FJsonObject>(), LoaderConfig.GetMatrix(), LoaderConfig.SceneScale);
+		if (NewParser)
+		{
+			NewParser->AsBlob.Append(DataPtr, DataNum);
+		}
+		return NewParser;
 	}
 
 	// detect binary format
@@ -478,7 +489,7 @@ bool FglTFRuntimeParser::LoadNodes()
 
 	const TArray<TSharedPtr<FJsonValue>>* JsonNodes;
 
-	// no meshes ?
+	// no nodes ?
 	if (!Root->TryGetArrayField("nodes", JsonNodes))
 	{
 		return false;
@@ -603,7 +614,7 @@ bool FglTFRuntimeParser::CheckJsonIndex(TSharedRef<FJsonObject> JsonObject, cons
 		return false;
 	}
 
-	for (TSharedPtr<FJsonValue> JsonItem : (*JsonArray))
+	for (const TSharedPtr<FJsonValue>& JsonItem : (*JsonArray))
 	{
 		JsonItems.Add(JsonItem.ToSharedRef());
 	}
@@ -657,7 +668,7 @@ TArray<TSharedRef<FJsonObject>> FglTFRuntimeParser::GetJsonObjectArrayFromExtens
 			const TArray<TSharedPtr<FJsonValue>>* Items;
 			if ((*JsonExtensionObject)->TryGetArrayField(FieldName, Items))
 			{
-				for (TSharedPtr<FJsonValue> Item : (*Items))
+				for (const TSharedPtr<FJsonValue>& Item : (*Items))
 				{
 					const TSharedPtr<FJsonObject>* Object = nullptr;
 					if (Item->TryGetObject(Object))
@@ -670,6 +681,60 @@ TArray<TSharedRef<FJsonObject>> FglTFRuntimeParser::GetJsonObjectArrayFromExtens
 	}
 
 	return Objects;
+}
+
+TArray<TSharedRef<FJsonObject>> FglTFRuntimeParser::GetJsonObjectArrayOfObjects(TSharedRef<FJsonObject> JsonObject, const FString& FieldName)
+{
+	TArray<TSharedRef<FJsonObject>> Items;
+
+	const TArray<TSharedPtr<FJsonValue>>* JsonArray = nullptr;
+	if (!JsonObject->TryGetArrayField(FieldName, JsonArray))
+	{
+		return Items;
+	}
+
+	for (const TSharedPtr<FJsonValue>& JsonItem : *JsonArray)
+	{
+		const TSharedPtr<FJsonObject>* JsonItemObject = nullptr;
+		if (JsonItem->TryGetObject(JsonItemObject))
+		{
+			Items.Add(JsonItemObject->ToSharedRef());
+		}
+	}
+
+	return Items;
+}
+
+FVector4 FglTFRuntimeParser::GetJsonObjectVector4(TSharedRef<FJsonObject> JsonObject, const FString& FieldName, const FVector4 DefaultValue)
+{
+	const TArray<TSharedPtr<FJsonValue>>* JsonArray = nullptr;
+	if (!JsonObject->TryGetArrayField(FieldName, JsonArray))
+	{
+		return DefaultValue;
+	}
+
+	FVector4 NewValue = DefaultValue;
+	for (int32 Index = 0; Index < 4; Index++)
+	{
+		if (JsonArray->IsValidIndex(Index))
+		{
+			TSharedPtr<FJsonValue> Item = (*JsonArray)[Index];
+			if (Item)
+			{
+				double Value = 0;
+				if (Item->TryGetNumber(Value))
+				{
+					NewValue[Index] = Value;
+				}
+			}
+		}
+		else
+		{
+			break;
+		}
+	}
+
+	return NewValue;
 }
 
 FString FglTFRuntimeParser::GetJsonObjectString(TSharedRef<FJsonObject> JsonObject, const FString& FieldName, const FString& DefaultValue)
@@ -867,11 +932,15 @@ bool FglTFRuntimeParser::LoadNode(int32 Index, FglTFRuntimeNode& Node)
 	if (!bAllNodesCached)
 	{
 		if (!LoadNodes())
+		{
 			return false;
+		}
 	}
 
 	if (Index >= AllNodesCache.Num())
+	{
 		return false;
+	}
 
 	Node = AllNodesCache[Index];
 	return true;
@@ -899,6 +968,41 @@ bool FglTFRuntimeParser::LoadNodeByName(const FString& Name, FglTFRuntimeNode& N
 
 	return false;
 }
+
+bool FglTFRuntimeParser::LoadJointByName(const int64 RootBoneIndex, const FString& Name, FglTFRuntimeNode& Node)
+{
+	// a bit hacky, but allows zero-copy for cached values
+	if (!bAllNodesCached)
+	{
+		if (!LoadNodes())
+		{
+			return false;
+		}
+	}
+
+	if (!LoadNode(RootBoneIndex, Node))
+	{
+		return false;
+	}
+
+	if (Node.Name == Name)
+	{
+		return true;
+	}
+
+	for (int32 Index : Node.ChildrenIndices)
+	{
+		FglTFRuntimeNode ChildNode;
+		if (LoadJointByName(Index, Name, ChildNode))
+		{
+			Node = ChildNode;
+			return true;
+		}
+	}
+
+	return false;
+}
+
 
 void FglTFRuntimeParser::AddError(const FString& ErrorContext, const FString& ErrorMessage)
 {
@@ -945,8 +1049,6 @@ bool FglTFRuntimeParser::LoadNode_Internal(int32 Index, TSharedRef<FJsonObject> 
 	Node.SkinIndex = GetJsonObjectIndex(JsonNodeObject, "skin", INDEX_NONE);
 
 	Node.CameraIndex = GetJsonObjectIndex(JsonNodeObject, "camera", INDEX_NONE);
-
-	Node.EmitterIndices = GetJsonExtensionObjectIndices(JsonNodeObject, "MSFT_audio_emitter", "emitters");
 
 	FMatrix Matrix = FMatrix::Identity;
 
@@ -1591,7 +1693,7 @@ USkeleton* FglTFRuntimeParser::LoadSkeleton(const int32 SkinIndex, const FglTFRu
 	}
 
 	return Skeleton;
-}
+	}
 
 bool FglTFRuntimeParser::NodeIsBone(const int32 NodeIndex)
 {
@@ -1705,11 +1807,11 @@ bool FglTFRuntimeParser::FillFakeSkeleton(FReferenceSkeleton& RefSkeleton, TMap<
 	return true;
 }
 
-bool FglTFRuntimeParser::FillReferenceSkeleton(TSharedRef<FJsonObject> JsonSkinObject, FReferenceSkeleton& RefSkeleton, TMap<int32, FName>& BoneMap, const FglTFRuntimeSkeletonConfig& SkeletonConfig)
+
+bool FglTFRuntimeParser::GetRootBoneIndex(TSharedRef<FJsonObject> JsonSkinObject, int64& RootBoneIndex, TArray<int32>& Joints, const FglTFRuntimeSkeletonConfig& SkeletonConfig)
 {
 	// get the list of valid joints	
 	const TArray<TSharedPtr<FJsonValue>>* JsonJoints;
-	TArray<int32> Joints;
 	if (JsonSkinObject->TryGetArrayField("joints", JsonJoints))
 	{
 		for (TSharedPtr<FJsonValue> JsonJoint : *JsonJoints)
@@ -1725,14 +1827,12 @@ bool FglTFRuntimeParser::FillReferenceSkeleton(TSharedRef<FJsonObject> JsonSkinO
 
 	if (Joints.Num() == 0)
 	{
-		AddError("FillReferenceSkeleton()", "No Joints available");
+		AddError("GetRootBoneIndex()", "No Joints available");
 		return false;
 	}
 
-	// fill the root bone
 	FglTFRuntimeNode RootNode;
-	int64 RootBoneIndex = INDEX_NONE;
-	bool bHasSpecificRoot = false;
+	RootBoneIndex = INDEX_NONE;
 
 	if (SkeletonConfig.RootNodeIndex > INDEX_NONE)
 	{
@@ -1748,7 +1848,6 @@ bool FglTFRuntimeParser::FillReferenceSkeleton(TSharedRef<FJsonObject> JsonSkinO
 	else if (JsonSkinObject->TryGetNumberField("skeleton", RootBoneIndex))
 	{
 		// use the "skeleton" field as the root bone
-		bHasSpecificRoot = true;
 	}
 	else
 	{
@@ -1757,9 +1856,25 @@ bool FglTFRuntimeParser::FillReferenceSkeleton(TSharedRef<FJsonObject> JsonSkinO
 
 	if (RootBoneIndex == INDEX_NONE)
 	{
-		AddError("FillReferenceSkeleton()", "Unable to find root node.");
+		AddError("GetRootBoneIndex()", "Unable to find root node.");
 		return false;
 	}
+
+	return true;
+}
+
+bool FglTFRuntimeParser::FillReferenceSkeleton(TSharedRef<FJsonObject> JsonSkinObject, FReferenceSkeleton& RefSkeleton, TMap<int32, FName>& BoneMap, const FglTFRuntimeSkeletonConfig& SkeletonConfig)
+{
+	int64 RootBoneIndex = INDEX_NONE;
+	TArray<int32> Joints;
+
+	if (!GetRootBoneIndex(JsonSkinObject, RootBoneIndex, Joints, SkeletonConfig))
+	{
+		return false;
+	}
+
+	// fill the root bone
+	FglTFRuntimeNode RootNode;
 
 	if (!LoadNode(RootBoneIndex, RootNode))
 	{
@@ -1767,29 +1882,16 @@ bool FglTFRuntimeParser::FillReferenceSkeleton(TSharedRef<FJsonObject> JsonSkinO
 		return false;
 	}
 
-	if (bHasSpecificRoot && !Joints.Contains(RootBoneIndex))
-	{
-		FglTFRuntimeNode ParentNode = RootNode;
-		while (ParentNode.ParentIndex != INDEX_NONE)
-		{
-			if (!LoadNode(ParentNode.ParentIndex, ParentNode))
-			{
-				return false;
-			}
-			RootNode.Transform *= ParentNode.Transform;
-		}
-	}
-
 	TMap<int32, FMatrix> InverseBindMatricesMap;
-	int64 inverseBindMatricesIndex;
-	if (JsonSkinObject->TryGetNumberField("inverseBindMatrices", inverseBindMatricesIndex))
+	int64 InverseBindMatricesIndex;
+	if (JsonSkinObject->TryGetNumberField("inverseBindMatrices", InverseBindMatricesIndex))
 	{
 		FglTFRuntimeBlob InverseBindMatricesBytes;
 		int64 ComponentType, Stride, Elements, ElementSize, Count;
 		bool bNormalized = false;
-		if (!GetAccessor(inverseBindMatricesIndex, ComponentType, Stride, Elements, ElementSize, Count, bNormalized, InverseBindMatricesBytes, nullptr))
+		if (!GetAccessor(InverseBindMatricesIndex, ComponentType, Stride, Elements, ElementSize, Count, bNormalized, InverseBindMatricesBytes, nullptr))
 		{
-			AddError("FillReferenceSkeleton()", FString::Printf(TEXT("Unable to load accessor: %lld."), inverseBindMatricesIndex));
+			AddError("FillReferenceSkeleton()", FString::Printf(TEXT("Unable to load accessor: %lld."), InverseBindMatricesIndex));
 			return false;
 		}
 
@@ -1824,7 +1926,7 @@ bool FglTFRuntimeParser::FillReferenceSkeleton(TSharedRef<FJsonObject> JsonSkinO
 	FReferenceSkeletonModifier Modifier = FReferenceSkeletonModifier(RefSkeleton, nullptr);
 
 	// now traverse from the root and check if the node is in the "joints" list
-	if (!TraverseJoints(Modifier, INDEX_NONE, RootNode, Joints, BoneMap, InverseBindMatricesMap, SkeletonConfig))
+	if (!TraverseJoints(Modifier, RootNode.Index, INDEX_NONE, RootNode, Joints, BoneMap, InverseBindMatricesMap, SkeletonConfig))
 	{
 		return false;
 	}
@@ -1834,7 +1936,7 @@ bool FglTFRuntimeParser::FillReferenceSkeleton(TSharedRef<FJsonObject> JsonSkinO
 	return true;
 }
 
-bool FglTFRuntimeParser::TraverseJoints(FReferenceSkeletonModifier& Modifier, int32 Parent, FglTFRuntimeNode& Node, const TArray<int32>& Joints, TMap<int32, FName>& BoneMap, const TMap<int32, FMatrix>& InverseBindMatricesMap, const FglTFRuntimeSkeletonConfig& SkeletonConfig)
+bool FglTFRuntimeParser::TraverseJoints(FReferenceSkeletonModifier& Modifier, const int32 RootIndex, int32 Parent, FglTFRuntimeNode& Node, const TArray<int32>& Joints, TMap<int32, FName>& BoneMap, const TMap<int32, FMatrix>& InverseBindMatricesMap, const FglTFRuntimeSkeletonConfig& SkeletonConfig)
 {
 	TArray<FString> AppendBones;
 	// add fake root bone ?
@@ -1850,6 +1952,11 @@ bool FglTFRuntimeParser::TraverseJoints(FReferenceSkeletonModifier& Modifier, in
 	}
 
 	FName BoneName = FName(*Node.Name);
+	if (SkeletonConfig.BoneRemapper.Remapper.IsBound())
+	{
+		BoneName = FName(SkeletonConfig.BoneRemapper.Remapper.Execute(Node.Index, Node.Name));
+	}
+
 	if (SkeletonConfig.BonesNameMap.Contains(BoneName.ToString()))
 	{
 		FString BoneNameMapValue = SkeletonConfig.BonesNameMap[BoneName.ToString()];
@@ -1872,7 +1979,7 @@ bool FglTFRuntimeParser::TraverseJoints(FReferenceSkeletonModifier& Modifier, in
 
 		BoneName = FName(BoneNameMapValue);
 	}
-	else if (SkeletonConfig.bAssignUnmappedBonesToParent)
+	else if (SkeletonConfig.BonesNameMap.Num() && SkeletonConfig.bAssignUnmappedBonesToParent)
 	{
 		int32 ParentNodeIndex = Node.ParentIndex;
 		while (ParentNodeIndex != INDEX_NONE)
@@ -1899,7 +2006,7 @@ bool FglTFRuntimeParser::TraverseJoints(FReferenceSkeletonModifier& Modifier, in
 						return false;
 					}
 
-					if (!TraverseJoints(Modifier, Parent, ChildNode, Joints, BoneMap, InverseBindMatricesMap, SkeletonConfig))
+					if (!TraverseJoints(Modifier, RootIndex, Parent, ChildNode, Joints, BoneMap, InverseBindMatricesMap, SkeletonConfig))
 					{
 						return false;
 					}
@@ -1916,32 +2023,89 @@ bool FglTFRuntimeParser::TraverseJoints(FReferenceSkeletonModifier& Modifier, in
 
 	// Check if a bone with the same name exists
 	int32 CollidingIndex = Modifier.FindBoneIndex(BoneName);
-	while (CollidingIndex != INDEX_NONE)
+	if (CollidingIndex != INDEX_NONE)
 	{
-		AddError("TraverseJoints()", FString::Printf(TEXT("Bone %s already exists."), *BoneName.ToString()));
 		if (SkeletonConfig.bSkipAlreadyExistentBoneNames)
 		{
+			AddError("TraverseJoints()", FString::Printf(TEXT("Stopping at Bone %s (already exists)."), *BoneName.ToString()));
 			return true;
 		}
-		return false;
+		else if (SkeletonConfig.bAppendNodeIndexOnNameCollision)
+		{
+			BoneName = FName(FString::Printf(TEXT("%s%d"), *BoneName.ToString(), Node.Index));
+			CollidingIndex = Modifier.FindBoneIndex(BoneName);
+			if (CollidingIndex != INDEX_NONE)
+			{
+				AddError("TraverseJoints()", FString::Printf(TEXT("Automatically renamed Bone %s already exists."), *BoneName.ToString()));
+				return false;
+			}
+		}
+		else
+		{
+			AddError("TraverseJoints()", FString::Printf(TEXT("Bone %s already exists."), *BoneName.ToString()));
+			return false;
+		}
 	}
 
 	FTransform Transform = Node.Transform;
 	if (InverseBindMatricesMap.Contains(Node.Index))
 	{
+		bool bSlowPath = false;
 		FMatrix M = InverseBindMatricesMap[Node.Index].Inverse();
-		if (Node.ParentIndex != INDEX_NONE && Joints.Contains(Node.ParentIndex))
+		if (Node.ParentIndex != INDEX_NONE && Node.Index != RootIndex)
 		{
-			M *= InverseBindMatricesMap[Node.ParentIndex];
+			if (InverseBindMatricesMap.Contains(Node.ParentIndex))
+			{
+				M *= InverseBindMatricesMap[Node.ParentIndex];
+			}
+			else
+			{
+				bSlowPath = true;
+			}
 		}
 
 		M.ScaleTranslation(FVector(SceneScale, SceneScale, SceneScale));
-		FMatrix SkeletonBasis = SceneBasis;
+		const FMatrix SkeletonBasis = SceneBasis;
 		Transform = FTransform(SkeletonBasis.Inverse() * M * SkeletonBasis);
-	}
-	else if (Joints.Contains(Node.Index))
-	{
-		AddError("TraverseJoints()", FString::Printf(TEXT("No bind transform for node %d %s"), Node.Index, *Node.Name));
+
+		// we are here if the parent has no joint inverse bind matrix (and we need to build the bind pose from it
+		// we could use the Skeleton hiearchy here for building the pose but we will check for inverse bind matrix too
+		// for improving performance
+		if (bSlowPath)
+		{
+			FTransform ParentTransform = FTransform::Identity;
+			int32 CurrentParentIndex = Node.ParentIndex;
+			while (CurrentParentIndex > INDEX_NONE)
+			{
+				FglTFRuntimeNode ParentNode;
+				if (!LoadNode(CurrentParentIndex, ParentNode))
+				{
+					return false;
+				}
+
+				// do we have an inverse bind matrix ?
+				if (InverseBindMatricesMap.Contains(CurrentParentIndex))
+				{
+					M = InverseBindMatricesMap[CurrentParentIndex];
+					M.ScaleTranslation(FVector(SceneScale, SceneScale, SceneScale));
+					Transform *= FTransform(SkeletonBasis.Inverse() * M * SkeletonBasis) * ParentTransform.Inverse();
+					ParentTransform = FTransform::Identity; // this is required for avoiding double transform application
+					break;
+				}
+				else // fallback to (slower) node transform
+				{
+					ParentTransform *= ParentNode.Transform;
+				}
+
+				if (CurrentParentIndex == RootIndex) // stop at the root
+				{
+					break;
+				}
+				CurrentParentIndex = ParentNode.ParentIndex;
+			}
+
+			Transform *= ParentTransform.Inverse();
+		}
 	}
 
 	Modifier.Add(FMeshBoneInfo(BoneName, Node.Name, Parent), Transform);
@@ -1978,7 +2142,7 @@ bool FglTFRuntimeParser::TraverseJoints(FReferenceSkeletonModifier& Modifier, in
 			return false;
 		}
 
-		if (!TraverseJoints(Modifier, NewParentIndex, ChildNode, Joints, BoneMap, InverseBindMatricesMap, SkeletonConfig))
+		if (!TraverseJoints(Modifier, RootIndex, NewParentIndex, ChildNode, Joints, BoneMap, InverseBindMatricesMap, SkeletonConfig))
 		{
 			return false;
 		}
@@ -2094,6 +2258,11 @@ bool FglTFRuntimeParser::LoadPrimitive(TSharedRef<FJsonObject> JsonPrimitiveObje
 	SCOPED_NAMED_EVENT(FglTFRuntimeParser_LoadPrimitive, FColor::Magenta);
 
 	OnPreLoadedPrimitive.Broadcast(AsShared(), JsonPrimitiveObject, Primitive);
+
+	if (!JsonPrimitiveObject->TryGetNumberField("mode", Primitive.Mode))
+	{
+		Primitive.Mode = 4; // triangles
+	}
 
 	const TSharedPtr<FJsonObject>* JsonAttributesObject;
 	if (!JsonPrimitiveObject->TryGetObjectField("attributes", JsonAttributesObject))
@@ -2352,52 +2521,97 @@ bool FglTFRuntimeParser::LoadPrimitive(TSharedRef<FJsonObject> JsonPrimitiveObje
 		}
 	}
 
+	// fixing indices... 5: TRIANGLE_STRIP 6: TRIANGLE_FAN
+	if (Primitive.Mode == 5)
+	{
+		TArray<uint32> StripIndices;
+		if (Primitive.Indices.Num() >= 3)
+		{
+			StripIndices.Add(Primitive.Indices[0]);
+			StripIndices.Add(Primitive.Indices[1]);
+			StripIndices.Add(Primitive.Indices[2]);
+			StripIndices.AddUninitialized((Primitive.Indices.Num() - 3) * 3);
+		}
+		int64 StripIndex = 3;
+		for (int64 Index = 3; Index < Primitive.Indices.Num(); Index++)
+		{
+			StripIndices[StripIndex] = StripIndices[StripIndex - 1];
+			StripIndices[StripIndex + 1] = StripIndices[StripIndex - 2];
+			StripIndices[StripIndex + 2] = Primitive.Indices[Index];
+			StripIndex += 3;
+		}
+		Primitive.Indices = StripIndices;
+	}
+	else if (Primitive.Mode == 6)
+	{
+		TArray<uint32> FanIndices;
+		if (Primitive.Indices.Num() >= 3)
+		{
+			FanIndices.Add(Primitive.Indices[0]);
+			FanIndices.Add(Primitive.Indices[1]);
+			FanIndices.Add(Primitive.Indices[2]);
+			FanIndices.AddUninitialized((Primitive.Indices.Num() - 3) * 3);
+		}
+		int64 FanIndex = 3;
+		for (int64 Index = 3; Index < Primitive.Indices.Num(); Index++)
+		{
+			FanIndices[FanIndex] = FanIndices[0];
+			FanIndices[FanIndex + 1] = FanIndices[FanIndex - 1];
+			FanIndices[FanIndex + 2] = Primitive.Indices[Index];
+			FanIndex += 3;
+		}
+		Primitive.Indices = FanIndices;
+	}
+
 	Primitive.Material = UMaterial::GetDefaultMaterial(MD_Surface);
 
-	int64 MaterialIndex = INDEX_NONE;
-	if (!MaterialsConfig.Variant.IsEmpty() && MaterialsVariants.Contains(MaterialsConfig.Variant))
+	if (!MaterialsConfig.bSkipLoad)
 	{
-		int32 WantedIndex = MaterialsVariants.IndexOfByKey(MaterialsConfig.Variant);
-		TArray<TSharedRef<FJsonObject>> VariantsMappings = GetJsonObjectArrayFromExtension(JsonPrimitiveObject, "KHR_materials_variants", "mappings");
-		bool bMappingFound = false;
-		for (TSharedRef<FJsonObject> VariantsMapping : VariantsMappings)
+		int64 MaterialIndex = INDEX_NONE;
+		if (!MaterialsConfig.Variant.IsEmpty() && MaterialsVariants.Contains(MaterialsConfig.Variant))
 		{
-			const TArray<TSharedPtr<FJsonValue>>* Variants;
-			if (VariantsMapping->TryGetArrayField("variants", Variants))
+			int32 WantedIndex = MaterialsVariants.IndexOfByKey(MaterialsConfig.Variant);
+			TArray<TSharedRef<FJsonObject>> VariantsMappings = GetJsonObjectArrayFromExtension(JsonPrimitiveObject, "KHR_materials_variants", "mappings");
+			bool bMappingFound = false;
+			for (TSharedRef<FJsonObject> VariantsMapping : VariantsMappings)
 			{
-				for (TSharedPtr<FJsonValue> Variant : (*Variants))
+				const TArray<TSharedPtr<FJsonValue>>* Variants;
+				if (VariantsMapping->TryGetArrayField("variants", Variants))
 				{
-					int64 VariantIndex;
-					if (Variant->TryGetNumber(VariantIndex) && VariantIndex == WantedIndex)
+					for (TSharedPtr<FJsonValue> Variant : (*Variants))
 					{
-						MaterialIndex = VariantsMapping->GetNumberField("material");
-						bMappingFound = true;
-						break;
+						int64 VariantIndex;
+						if (Variant->TryGetNumber(VariantIndex) && VariantIndex == WantedIndex)
+						{
+							MaterialIndex = VariantsMapping->GetNumberField("material");
+							bMappingFound = true;
+							break;
+						}
 					}
 				}
+				if (bMappingFound)
+				{
+					break;
+				}
 			}
-			if (bMappingFound)
+		}
+
+		if (MaterialIndex == INDEX_NONE)
+		{
+			if (!JsonPrimitiveObject->TryGetNumberField("material", MaterialIndex))
 			{
-				break;
+				MaterialIndex = INDEX_NONE;
 			}
 		}
-	}
 
-	if (MaterialIndex == INDEX_NONE)
-	{
-		if (!JsonPrimitiveObject->TryGetNumberField("material", MaterialIndex))
+		if (MaterialIndex != INDEX_NONE)
 		{
-			MaterialIndex = INDEX_NONE;
-		}
-	}
-
-	if (MaterialIndex != INDEX_NONE)
-	{
-		Primitive.Material = LoadMaterial(MaterialIndex, MaterialsConfig, Primitive.Colors.Num() > 0, Primitive.MaterialName);
-		if (!Primitive.Material)
-		{
-			AddError("LoadPrimitive()", FString::Printf(TEXT("Unable to load material %lld"), MaterialIndex));
-			return false;
+			Primitive.Material = LoadMaterial(MaterialIndex, MaterialsConfig, Primitive.Colors.Num() > 0, Primitive.MaterialName);
+			if (!Primitive.Material)
+			{
+				AddError("LoadPrimitive()", FString::Printf(TEXT("Unable to load material %lld"), MaterialIndex));
+				return false;
+			}
 		}
 	}
 
@@ -2407,7 +2621,7 @@ bool FglTFRuntimeParser::LoadPrimitive(TSharedRef<FJsonObject> JsonPrimitiveObje
 }
 
 
-bool FglTFRuntimeParser::GetBuffer(int32 Index, FglTFRuntimeBlob& Blob)
+bool FglTFRuntimeParser::GetBuffer(const int32 Index, FglTFRuntimeBlob& Blob)
 {
 	if (Index < 0)
 	{
@@ -2524,35 +2738,29 @@ bool FglTFRuntimeParser::ParseBase64Uri(const FString& Uri, TArray64<uint8>& Byt
 	return bSuccess;
 }
 
-bool FglTFRuntimeParser::GetBufferView(int32 Index, FglTFRuntimeBlob& Blob, int64& Stride)
+bool FglTFRuntimeParser::GetBufferView(const int32 Index, FglTFRuntimeBlob& Blob, int64& Stride)
 {
-	if (Index < 0)
+	TSharedPtr<FJsonObject> JsonBufferViewObject = GetJsonObjectFromRootIndex("bufferViews", Index);
+	if (!JsonBufferViewObject)
 	{
 		return false;
 	}
 
-	const TArray<TSharedPtr<FJsonValue>>* JsonBufferViews;
-
-	// no bufferViews ?
-	if (!Root->TryGetArrayField("bufferViews", JsonBufferViews))
+	TSharedPtr<FJsonObject> JsonBufferViewCompressedObject = GetJsonObjectExtension(JsonBufferViewObject.ToSharedRef(), "EXT_meshopt_compression");
+	if (JsonBufferViewCompressedObject)
 	{
-		return false;
+		JsonBufferViewObject = JsonBufferViewCompressedObject;
+		if (CompressedBufferViewsCache.Contains(Index))
+		{
+			Blob.Data = CompressedBufferViewsCache[Index].GetData();
+			Blob.Num = CompressedBufferViewsCache[Index].Num();
+			Stride = CompressedBufferViewsStridesCache[Index];
+			return true;
+		}
 	}
-
-	if (Index >= JsonBufferViews->Num())
-	{
-		return false;
-	}
-
-	TSharedPtr<FJsonObject> JsonBufferObject = (*JsonBufferViews)[Index]->AsObject();
-	if (!JsonBufferObject)
-	{
-		return false;
-	}
-
 
 	int64 BufferIndex;
-	if (!JsonBufferObject->TryGetNumberField("buffer", BufferIndex))
+	if (!JsonBufferViewObject->TryGetNumberField("buffer", BufferIndex))
 	{
 		return false;
 	}
@@ -2564,18 +2772,18 @@ bool FglTFRuntimeParser::GetBufferView(int32 Index, FglTFRuntimeBlob& Blob, int6
 	}
 
 	int64 ByteLength;
-	if (!JsonBufferObject->TryGetNumberField("byteLength", ByteLength))
+	if (!JsonBufferViewObject->TryGetNumberField("byteLength", ByteLength))
 	{
 		return false;
 	}
 
 	int64 ByteOffset;
-	if (!JsonBufferObject->TryGetNumberField("byteOffset", ByteOffset))
+	if (!JsonBufferViewObject->TryGetNumberField("byteOffset", ByteOffset))
 	{
 		ByteOffset = 0;
 	}
 
-	if (!JsonBufferObject->TryGetNumberField("byteStride", Stride))
+	if (!JsonBufferViewObject->TryGetNumberField("byteStride", Stride))
 	{
 		Stride = 0;
 	}
@@ -2587,10 +2795,45 @@ bool FglTFRuntimeParser::GetBufferView(int32 Index, FglTFRuntimeBlob& Blob, int6
 
 	Blob.Data = BufferBlob.Data + ByteOffset;
 	Blob.Num = ByteLength;
+
+	if (JsonBufferViewCompressedObject)
+	{
+		// decompress bitstream
+		if (Stride == 0)
+		{
+			return false;
+		}
+		int64 Elements;
+		if (!JsonBufferViewObject->TryGetNumberField("count", Elements))
+		{
+			return false;
+		}
+		FString MeshOptMode;
+		if (!JsonBufferViewObject->TryGetStringField("mode", MeshOptMode))
+		{
+			return false;
+		}
+		FString MeshOptFilter;
+		if (!JsonBufferViewObject->TryGetStringField("filter", MeshOptFilter))
+		{
+			MeshOptFilter = "NONE";
+		}
+
+		CompressedBufferViewsCache.Add(Index);
+		if (!DecompressMeshOptimizer(Blob, Stride, Elements, MeshOptMode, MeshOptFilter, CompressedBufferViewsCache[Index]))
+		{
+			CompressedBufferViewsCache.Remove(Index);
+			return false;
+		}
+		Blob.Data = CompressedBufferViewsCache[Index].GetData();
+		Blob.Num = CompressedBufferViewsCache[Index].Num();
+		CompressedBufferViewsStridesCache.Add(Index, Stride);
+	}
+
 	return true;
 }
 
-bool FglTFRuntimeParser::GetAccessor(int32 Index, int64& ComponentType, int64& Stride, int64& Elements, int64& ElementSize, int64& Count, bool& bNormalized, FglTFRuntimeBlob& Blob, const FglTFRuntimeBlob* AdditionalBufferView)
+bool FglTFRuntimeParser::GetAccessor(const int32 Index, int64& ComponentType, int64& Stride, int64& Elements, int64& ElementSize, int64& Count, bool& bNormalized, FglTFRuntimeBlob& Blob, const FglTFRuntimeBlob* AdditionalBufferView)
 {
 
 	TSharedPtr<FJsonObject> JsonAccessorObject = GetJsonObjectFromRootIndex("accessors", Index);
@@ -3316,6 +3559,11 @@ bool FglTFRuntimeParser::GetJsonObjectBytes(TSharedRef<FJsonObject> JsonObject, 
 				return false;
 			}
 		}
+		else if (Uri.StartsWith("http://") || Uri.StartsWith("https://"))
+		{
+			AddError("GetJsonObjectBytes()", FString::Printf(TEXT("Unable to open from external url %s (feature not supported)"), *Uri));
+			return false;
+		}
 		else
 		{
 			bool bFound = false;
@@ -3502,7 +3750,7 @@ void FglTFRuntimeParser::AddAdditionalBufferView(const int64 Index, const FStrin
 
 }
 
-bool FglTFRuntimeParser::GetNumberFromExtras(const FString& Key, float &Value) const
+bool FglTFRuntimeParser::GetNumberFromExtras(const FString& Key, float& Value) const
 {
 	TSharedPtr<FJsonObject> JsonExtras = GetJsonObjectExtras(Root);
 	if (!JsonExtras)
@@ -3585,4 +3833,620 @@ bool FglTFRuntimeParser::GetStringArrayFromExtras(const FString& Key, TArray<FSt
 	}
 
 	return JsonExtras->TryGetStringArrayField(Key, StringArray);
+}
+
+TSharedPtr<FJsonObject> FglTFRuntimeParser::GetNodeExtensionObject(const int32 NodeIndex, const FString& ExtensionName)
+{
+	TSharedPtr<FJsonObject> JsonNodeObject = GetJsonObjectFromRootIndex("nodes", NodeIndex);
+	if (!JsonNodeObject)
+	{
+		return nullptr;
+	}
+
+	return GetJsonObjectExtension(JsonNodeObject.ToSharedRef(), ExtensionName);
+}
+
+TSharedPtr<FJsonObject> FglTFRuntimeParser::GetNodeObject(const int32 NodeIndex)
+{
+	return GetJsonObjectFromRootIndex("nodes", NodeIndex);
+}
+
+bool FglTFRuntimeParser::DecompressMeshOptimizer(const FglTFRuntimeBlob& Blob, const int64 Stride, const int64 Elements, const FString& Mode, const FString& Filter, TArray64<uint8>& UncompressedBytes)
+{
+	auto DecodeZigZag = [](uint8 V)
+	{
+		return ((V & 1) != 0) ? ~(V >> 1) : (V >> 1);
+	};
+
+	if (Mode == "ATTRIBUTES" && Blob.Num > 32 && Blob.Data[0] == 0xa0)
+	{
+		int64 Offset = 1;
+		const int64 Limit = Blob.Num - Stride;
+
+		TArray<uint8> BaseLine;
+		BaseLine.Append(Blob.Data + Blob.Num - Stride, Stride);
+		if (BaseLine.Num() < 16)
+		{
+			BaseLine.AddZeroed(16 - BaseLine.Num());
+	}
+
+		const int64 MaxBlockElements = FMath::Min<int64>((8192 / Stride) & ~15, 256);
+
+		// preallocated
+		UncompressedBytes.AddUninitialized(Elements * Stride);
+
+		for (int64 ElementIndex = 0; ElementIndex < Elements; ElementIndex += MaxBlockElements)
+		{
+			int64 BlockElements = FMath::Min<int64>(Elements - ElementIndex, MaxBlockElements);
+
+#if ENGINE_MAJOR_VERSION > 4
+			int64 GroupCount = FMath::CeilToInt64(BlockElements / 16.0);
+#else
+			int64 GroupCount = FMath::CeilToInt(BlockElements / 16.0);
+#endif
+
+			int64 NumberOfHeaderBytes = GroupCount / 4;
+			if ((GroupCount % 4) > 0)
+			{
+				NumberOfHeaderBytes++;
+			}
+
+			for (int64 ElementByteIndex = 0; ElementByteIndex < Stride; ElementByteIndex++)
+			{
+
+				if (Offset + NumberOfHeaderBytes > Limit)
+				{
+					return false;
+				}
+
+				TArray64<uint8> Groups;
+				for (int64 i = 0; i < NumberOfHeaderBytes; i++)
+				{
+					Groups.Add(Blob.Data[Offset] & 0x03);
+					Groups.Add((Blob.Data[Offset] >> 2) & 0x03);
+					Groups.Add((Blob.Data[Offset] >> 4) & 0x03);
+					Groups.Add((Blob.Data[Offset] >> 6) & 0x03);
+					Offset++;
+				}
+
+				for (int64 GroupIndex = 0; GroupIndex < GroupCount; GroupIndex++)
+				{
+					if (Groups[GroupIndex] == 0)
+					{
+						for (int32 ByteIndex = 0; ByteIndex < 16; ByteIndex++)
+						{
+							const int64 DestinationOffset = (ElementIndex + (GroupIndex * 16) + ByteIndex) * Stride + ElementByteIndex;
+							if (DestinationOffset >= UncompressedBytes.Num())
+							{
+								break;
+							}
+							UncompressedBytes[DestinationOffset] = BaseLine[ElementByteIndex];
+						}
+					}
+					else if (Groups[GroupIndex] == 1)
+					{
+						if (Offset + 4 > Limit)
+						{
+							return false;
+						}
+						TArray<uint8> Deltas;
+						for (int32 ByteIndex = 0; ByteIndex < 4; ByteIndex++)
+						{
+							Deltas.Add((Blob.Data[Offset] >> 6) & 0x03);
+							Deltas.Add((Blob.Data[Offset] >> 4) & 0x03);
+							Deltas.Add((Blob.Data[Offset] >> 2) & 0x03);
+							Deltas.Add(Blob.Data[Offset] & 0x03);
+							Offset++;
+						}
+
+						for (int32 ByteIndex = 0; ByteIndex < 16; ByteIndex++)
+						{
+							uint8 Delta = 0;
+							if (Deltas[ByteIndex] == 0x03)
+							{
+								if (Offset + 1 <= Limit)
+								{
+									Delta = DecodeZigZag(Blob.Data[Offset++]);
+								}
+								else
+								{
+									return false;
+								}
+							}
+							else
+							{
+								Delta = DecodeZigZag(Deltas[ByteIndex]);
+							}
+
+							const int64 DestinationOffset = (ElementIndex + (GroupIndex * 16) + ByteIndex) * Stride + ElementByteIndex;
+							if (DestinationOffset >= UncompressedBytes.Num())
+							{
+								continue;
+							}
+							BaseLine[ElementByteIndex] += Delta;
+							UncompressedBytes[DestinationOffset] = BaseLine[ElementByteIndex];
+						}
+					}
+					else if (Groups[GroupIndex] == 2)
+					{
+						if (Offset + 8 > Limit)
+						{
+							return false;
+						}
+						TArray<uint8> Deltas;
+						for (int32 ByteIndex = 0; ByteIndex < 8; ByteIndex++)
+						{
+							Deltas.Add((Blob.Data[Offset] >> 4) & 0x0F);
+							Deltas.Add(Blob.Data[Offset] & 0x0F);
+							Offset++;
+						}
+
+						for (int32 ByteIndex = 0; ByteIndex < 16; ByteIndex++)
+						{
+							uint8 Delta = 0;
+							if (Deltas[ByteIndex] == 0x0F)
+							{
+								if (Offset + 1 <= Limit)
+								{
+									Delta = DecodeZigZag(Blob.Data[Offset++]);
+								}
+								else
+								{
+									return false;
+								}
+							}
+							else
+							{
+								Delta = DecodeZigZag(Deltas[ByteIndex]);
+							}
+
+							const int64 DestinationOffset = (ElementIndex + (GroupIndex * 16) + ByteIndex) * Stride + ElementByteIndex;
+							if (DestinationOffset >= UncompressedBytes.Num())
+							{
+								continue;
+							}
+							BaseLine[ElementByteIndex] += Delta;
+							UncompressedBytes[DestinationOffset] = BaseLine[ElementByteIndex];
+						}
+					}
+					else if (Groups[GroupIndex] == 3)
+					{
+						if (Offset + 16 > Limit)
+						{
+							return false;
+						}
+						for (int32 ByteIndex = 0; ByteIndex < 16; ByteIndex++)
+						{
+							uint8 Delta = DecodeZigZag(Blob.Data[Offset++]);
+							const int64 DestinationOffset = (ElementIndex + (GroupIndex * 16) + ByteIndex) * Stride + ElementByteIndex;
+							if (DestinationOffset >= UncompressedBytes.Num())
+							{
+								continue;
+							}
+							BaseLine[ElementByteIndex] += Delta;
+							UncompressedBytes[DestinationOffset] = BaseLine[ElementByteIndex];
+						}
+					}
+				}
+			}
+		}
+
+}
+	else if (Mode == "TRIANGLES" && Blob.Num >= 17 && Blob.Data[0] == 0xe1 && (Stride == 2 || Stride == 4) && ((Elements % 3) == 0))
+	{
+		TArray<uint8> CodeAux;
+		const int64 Limit = Blob.Num - 16;
+		CodeAux.Append(Blob.Data + Limit, 16);
+
+		uint32 Next = 0;
+		uint32 Last = 0;
+		TArray<TPair<uint32, uint32>> EdgeFifo;
+		TArray<uint32> VertexFifo;
+
+		int64 Offset = 1;
+		const uint32 TrianglesNum = Elements / 3;
+		int64 DataOffset = Offset + TrianglesNum;
+		int64 TriangleOffset = 0;
+
+		UncompressedBytes.AddUninitialized(Elements * Stride);
+
+		auto EmitTriangle = [Stride, &TriangleOffset, &UncompressedBytes](const uint32 A, const uint32 B, const uint32 C)
+		{
+			if (Stride == 2)
+			{
+				const uint16 AShort = A;
+				const uint16 BShort = B;
+				const uint16 CShort = C;
+				UncompressedBytes[TriangleOffset++] = reinterpret_cast<const uint8*>(&AShort)[0];
+				UncompressedBytes[TriangleOffset++] = reinterpret_cast<const uint8*>(&AShort)[1];
+				UncompressedBytes[TriangleOffset++] = reinterpret_cast<const uint8*>(&BShort)[0];
+				UncompressedBytes[TriangleOffset++] = reinterpret_cast<const uint8*>(&BShort)[1];
+				UncompressedBytes[TriangleOffset++] = reinterpret_cast<const uint8*>(&CShort)[0];
+				UncompressedBytes[TriangleOffset++] = reinterpret_cast<const uint8*>(&CShort)[1];
+
+			}
+			else
+			{
+				UncompressedBytes[TriangleOffset++] = reinterpret_cast<const uint8*>(&A)[0];
+				UncompressedBytes[TriangleOffset++] = reinterpret_cast<const uint8*>(&A)[1];
+				UncompressedBytes[TriangleOffset++] = reinterpret_cast<const uint8*>(&A)[2];
+				UncompressedBytes[TriangleOffset++] = reinterpret_cast<const uint8*>(&A)[3];
+				UncompressedBytes[TriangleOffset++] = reinterpret_cast<const uint8*>(&B)[0];
+				UncompressedBytes[TriangleOffset++] = reinterpret_cast<const uint8*>(&B)[1];
+				UncompressedBytes[TriangleOffset++] = reinterpret_cast<const uint8*>(&B)[2];
+				UncompressedBytes[TriangleOffset++] = reinterpret_cast<const uint8*>(&B)[3];
+				UncompressedBytes[TriangleOffset++] = reinterpret_cast<const uint8*>(&C)[0];
+				UncompressedBytes[TriangleOffset++] = reinterpret_cast<const uint8*>(&C)[1];
+				UncompressedBytes[TriangleOffset++] = reinterpret_cast<const uint8*>(&C)[2];
+				UncompressedBytes[TriangleOffset++] = reinterpret_cast<const uint8*>(&C)[3];
+			}
+		};
+
+		auto DecodeIndex = [&Blob, &DataOffset, &Last, Limit]() -> bool
+		{
+			uint32 V = 0;
+			for (int32 Shift = 0; ; Shift += 7)
+			{
+				if (DataOffset >= Limit)
+				{
+					return false;
+				}
+
+				const uint32 Byte = Blob.Data[DataOffset++];
+				V |= (Byte & 0x7F) << Shift;
+
+				if (Byte < 0x80)
+				{
+					break;
+				}
+			}
+
+			int32 Delta = ((V & 1) != 0) ? ~(V >> 1) : (V >> 1);
+
+			Last += Delta;
+			return true;
+		};
+
+		for (uint32 TriangleIndex = 0; TriangleIndex < TrianglesNum; TriangleIndex++)
+		{
+			if (Offset >= Limit)
+			{
+				return false;
+			}
+			uint8 Code = Blob.Data[Offset++];
+			uint8 NibbleLeft = Code >> 4;
+			uint8 NibbleRight = Code & 0x0f;
+
+			if (NibbleLeft < 0xf && NibbleRight == 0) // 0xX0
+			{
+				if (NibbleLeft >= EdgeFifo.Num())
+				{
+					return false;
+				}
+				const TPair<uint32, uint32> AB = EdgeFifo[NibbleLeft];
+				const uint32 C = Next++;
+
+				EdgeFifo.Insert(TPair<uint32, uint32>(C, AB.Value), 0); // push CB
+				EdgeFifo.Insert(TPair<uint32, uint32>(AB.Key, C), 0); // push AC
+				VertexFifo.Insert(C, 0);
+
+				EmitTriangle(AB.Key, AB.Value, C);
+			}
+			else if (NibbleLeft < 0xf && NibbleRight > 0 && NibbleRight < 0x0d) // 0xXY
+			{
+				if (NibbleLeft >= EdgeFifo.Num())
+				{
+					return false;
+				}
+				const TPair<uint32, uint32> AB = EdgeFifo[NibbleLeft];
+
+				if (NibbleRight >= VertexFifo.Num())
+				{
+					return false;
+				}
+
+				const uint32 C = VertexFifo[NibbleRight];
+				EdgeFifo.Insert(TPair<uint32, uint32>(C, AB.Value), 0); // push CB
+				EdgeFifo.Insert(TPair<uint32, uint32>(AB.Key, C), 0); // push AC
+
+				EmitTriangle(AB.Key, AB.Value, C);
+			}
+			else if (NibbleLeft < 0xf && NibbleRight == 0x0d) // 0xXd
+			{
+				if (NibbleLeft >= EdgeFifo.Num())
+				{
+					return false;
+				}
+				const TPair<uint32, uint32> AB = EdgeFifo[NibbleLeft];
+
+				const uint32 C = Last - 1;
+				Last = C;
+
+				EdgeFifo.Insert(TPair<uint32, uint32>(C, AB.Value), 0); // push CB
+				EdgeFifo.Insert(TPair<uint32, uint32>(AB.Key, C), 0); // push AC
+				VertexFifo.Insert(C, 0);
+
+				EmitTriangle(AB.Key, AB.Value, C);
+			}
+			else if (NibbleLeft < 0xf && NibbleRight == 0x0e) // 0xXe
+			{
+				if (NibbleLeft >= EdgeFifo.Num())
+				{
+					return false;
+				}
+				const TPair<uint32, uint32> AB = EdgeFifo[NibbleLeft];
+
+				const uint32 C = Last + 1;
+				Last = C;
+
+				EdgeFifo.Insert(TPair<uint32, uint32>(C, AB.Value), 0); // push CB
+				EdgeFifo.Insert(TPair<uint32, uint32>(AB.Key, C), 0); // push AC
+				VertexFifo.Insert(C, 0);
+
+				EmitTriangle(AB.Key, AB.Value, C);
+			}
+			else if (NibbleLeft < 0xf && NibbleRight == 0x0f) // 0xXf
+			{
+				if (NibbleLeft >= EdgeFifo.Num())
+				{
+					return false;
+				}
+				const TPair<uint32, uint32> AB = EdgeFifo[NibbleLeft];
+
+				if (!DecodeIndex())
+				{
+					return false;
+				}
+
+				const uint32 C = Last;
+
+				EdgeFifo.Insert(TPair<uint32, uint32>(C, AB.Value), 0); // push CB
+				EdgeFifo.Insert(TPair<uint32, uint32>(AB.Key, C), 0); // push AC
+				VertexFifo.Insert(C, 0);
+
+				EmitTriangle(AB.Key, AB.Value, C);
+			}
+			else if (NibbleLeft == 0xf && NibbleRight < 0xe) // 0xfY
+			{
+				const uint8 ZW = CodeAux[NibbleRight];
+				const uint8 Z = ZW >> 4;
+				const uint8 W = ZW & 0x0f;
+
+				const uint32 A = Next++;
+				uint32 B = 0;
+				uint32 C = 0;
+
+				if (Z == 0)
+				{
+					B = Next++;
+				}
+				else
+				{
+					if (Z - 1 >= VertexFifo.Num())
+					{
+						return false;
+					}
+					B = VertexFifo[Z - 1];
+				}
+
+				if (W == 0)
+				{
+					C = Next++;
+				}
+				else
+				{
+					if (W - 1 >= VertexFifo.Num())
+					{
+						return false;
+					}
+					C = VertexFifo[W - 1];
+				}
+
+				EdgeFifo.Insert(TPair<uint32, uint32>(B, A), 0); // push BA
+				EdgeFifo.Insert(TPair<uint32, uint32>(C, B), 0); // push CB
+				EdgeFifo.Insert(TPair<uint32, uint32>(A, C), 0); // push AC
+				VertexFifo.Insert(A, 0);
+				if (Z == 0)
+				{
+					VertexFifo.Insert(B, 0);
+				}
+				if (W == 0)
+				{
+					VertexFifo.Insert(C, 0);
+				}
+
+				EmitTriangle(A, B, C);
+			}
+			else if (Code == 0xfe || Code == 0xff) // 0xfe - 0xff
+			{
+				if (DataOffset >= Limit)
+				{
+					return false;
+				}
+
+				uint8 ZW = Blob.Data[DataOffset++];
+				uint8 Z = ZW >> 4;
+				uint8 W = ZW & 0x0f;
+				if (ZW == 0)
+				{
+					Next = 0;
+				}
+
+				uint32 A = 0;
+				if (Code == 0xfe)
+				{
+					A = Next++;
+				}
+				else
+				{
+					if (!DecodeIndex())
+					{
+						return false;
+					}
+					A = Last;
+				}
+
+				uint32 B = 0;
+				if (Z == 0)
+				{
+					B = Next++;
+				}
+				else if (Z < 0xf)
+				{
+					if (Z - 1 >= VertexFifo.Num())
+					{
+						return false;
+					}
+					B = VertexFifo[Z - 1];
+				}
+				else
+				{
+					if (!DecodeIndex())
+					{
+						return false;
+					}
+					B = Last;
+				}
+
+				uint32 C = 0;
+				if (W == 0)
+				{
+					C = Next++;
+				}
+				else if (W < 0xf)
+				{
+					if (W - 1 >= VertexFifo.Num())
+					{
+						return false;
+					}
+					C = VertexFifo[W - 1];
+				}
+				else
+				{
+					if (!DecodeIndex())
+					{
+						return false;
+					}
+					C = Last;
+				}
+
+				EdgeFifo.Insert(TPair<uint32, uint32>(B, A), 0); // push BA
+				EdgeFifo.Insert(TPair<uint32, uint32>(C, B), 0); // push CB
+				EdgeFifo.Insert(TPair<uint32, uint32>(A, C), 0); // push AC
+				VertexFifo.Insert(A, 0);
+				if (Z == 0 || Z == 0xf)
+				{
+					VertexFifo.Insert(B, 0);
+				}
+				if (W == 0 || W == 0xf)
+				{
+					VertexFifo.Insert(C, 0);
+				}
+
+				EmitTriangle(A, B, C);
+			}
+		}
+	}
+	else
+	{
+		return false;
+	}
+
+	if (UncompressedBytes.Num() > 0)
+	{
+		if (Filter == "OCTAHEDRAL" && (Stride == 4 || Stride == 8))
+		{
+			for (int64 ElementIndex = 0; ElementIndex < Elements; ElementIndex++)
+			{
+				int64 Offset = ElementIndex * Stride;
+				if (Stride == 4)
+				{
+					int8* Data = reinterpret_cast<int8*>(UncompressedBytes.GetData());
+					float One = Data[Offset + 2];
+					float X = Data[Offset] / One;
+					float Y = Data[Offset + 1] / One;
+					float Z = 1.0f - FMath::Abs(X) - FMath::Abs(Y);
+
+					float T = FMath::Max(-Z, 0.0f);
+
+					X -= (X >= 0) ? T : -T;
+					Y -= (Y >= 0) ? T : -T;
+
+					float Len = FMath::Sqrt(X * X + Y * Y + Z * Z);
+
+					X /= Len;
+					Y /= Len;
+					Z /= Len;
+
+					Data[Offset] = FMath::RoundToInt(X * 127);
+					Data[Offset + 1] = FMath::RoundToInt(Y * 127);
+					Data[Offset + 2] = FMath::RoundToInt(Z * 127);
+				}
+				else
+				{
+					int16* Data = reinterpret_cast<int16*>(UncompressedBytes.GetData());
+					float One = Data[Offset + 2];
+					float X = Data[Offset] / One;
+					float Y = Data[Offset + 1] / One;
+					float Z = 1.0f - FMath::Abs(X) - FMath::Abs(Y);
+
+					float T = FMath::Max(-Z, 0.0f);
+
+					X -= (X >= 0) ? T : -T;
+					Y -= (Y >= 0) ? T : -T;
+
+					float Len = FMath::Sqrt(X * X + Y * Y + Z * Z);
+
+					X /= Len;
+					Y /= Len;
+					Z /= Len;
+
+					Data[Offset] = FMath::RoundToInt(X * 32767);
+					Data[Offset + 1] = FMath::RoundToInt(Y * 32767);
+					Data[Offset + 2] = FMath::RoundToInt(Z * 32767);
+				}
+			}
+		}
+		else if (Filter == "QUATERNION" && Stride == 8)
+		{
+			int16* Data = reinterpret_cast<int16*>(UncompressedBytes.GetData());
+
+			const float Range = 1.0f / FMath::Sqrt(2.0f);
+
+			for (int64 Offset = 0; Offset < Elements * 4; Offset += 4)
+			{
+				float One = Data[Offset + 3] | 3;
+
+				float X = Data[Offset] / One * Range;
+				float Y = Data[Offset + 1] / One * Range;
+				float Z = Data[Offset + 2] / One * Range;
+
+				float W = FMath::Sqrt(FMath::Max(0.0, 1.0 - X * X - Y * Y - Z * Z));
+
+				int32 MaxComp = Data[Offset + 3] & 3;
+
+				Data[Offset + ((MaxComp + 1) % 4)] = FMath::RoundToInt(X * 32767.0);
+				Data[Offset + ((MaxComp + 2) % 4)] = FMath::RoundToInt(Y * 32767.0);
+				Data[Offset + ((MaxComp + 3) % 4)] = FMath::RoundToInt(Z * 32767.0);
+				Data[Offset + ((MaxComp + 0) % 4)] = FMath::RoundToInt(W * 32767.0);
+			}
+		}
+		else if (Filter == "EXPONENTIAL" && (Stride % 4) == 0)
+		{
+			int32* Data = reinterpret_cast<int32*>(UncompressedBytes.GetData());
+			for (int64 Offset = 0; Offset < UncompressedBytes.Num() / 4; Offset += 4)
+			{
+				int32 E = Data[Offset] >> 24;
+				int32 M = (Data[Offset] << 8) >> 8;
+				Data[Offset] = FMath::Pow(2.0f, E) * M;
+			}
+		}
+		else if (Filter != "" && Filter != "NONE")
+		{
+			AddError("DecompressMeshOptimizer()", "Unsupported Filter");
+			return false;
+		}
+	}
+
+	return true;
 }

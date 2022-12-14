@@ -98,6 +98,14 @@ struct FglTFRuntimeBasisMatrix
 	{
 		return FBasisVectorMatrix(XAxis, YAxis, ZAxis, Origin);
 	}
+
+	FglTFRuntimeBasisMatrix()
+	{
+		XAxis = FVector::ZeroVector;
+		YAxis = FVector::ZeroVector;
+		ZAxis = FVector::ZeroVector;
+		Origin = FVector::ZeroVector;
+	}
 };
 
 USTRUCT(BlueprintType)
@@ -146,6 +154,9 @@ struct FglTFRuntimeConfig
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "glTFRuntime")
 	FString RuntimeContextString;
 
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "glTFRuntime")
+	bool bAsBlob;
+
 	FglTFRuntimeConfig()
 	{
 		TransformBaseType = EglTFRuntimeTransformBaseType::Default;
@@ -157,6 +168,7 @@ struct FglTFRuntimeConfig
 		bOverrideBaseDirectoryFromContentDir = false;
 		ArchiveAutoEntryPointExtensions = ".glb .gltf .json .js";
 		RuntimeContextObject = nullptr;
+		bAsBlob = false;
 	}
 
 	FMatrix GetMatrix() const
@@ -211,8 +223,10 @@ struct FglTFRuntimeScene
 	UPROPERTY(VisibleAnywhere, BlueprintReadonly, Category = "glTFRuntime")
 	TArray<int32> RootNodesIndices;
 
-	UPROPERTY(VisibleAnywhere, BlueprintReadonly, Category = "glTFRuntime")
-	TArray<int32> EmitterIndices;
+	FglTFRuntimeScene()
+	{
+		Index = INDEX_NONE;
+	}
 };
 
 
@@ -244,9 +258,6 @@ struct FglTFRuntimeNode
 
 	UPROPERTY(VisibleAnywhere, BlueprintReadonly, Category = "glTFRuntime")
 	int32 ParentIndex;
-
-	UPROPERTY(VisibleAnywhere, BlueprintReadonly, Category = "glTFRuntime")
-	TArray<int32> EmitterIndices;
 
 	FglTFRuntimeNode()
 	{
@@ -313,6 +324,11 @@ struct FglTFRuntimeBone
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "glTFRuntime")
 	FTransform Transform;
+
+	FglTFRuntimeBone()
+	{
+		ParentIndex = INDEX_NONE;
+	}
 };
 
 USTRUCT(BlueprintType)
@@ -344,12 +360,19 @@ struct FglTFRuntimeImagesConfig
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "glTFRuntime")
 	bool bSRGB;
 
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "glTFRuntime")
+	int32 MaxWidth;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "glTFRuntime")
+	int32 MaxHeight;
 
 	FglTFRuntimeImagesConfig()
 	{
 		Compression = TextureCompressionSettings::TC_Default;
 		Group = TextureGroup::TEXTUREGROUP_World;
 		bSRGB = false;
+		MaxWidth = 0;
+		MaxHeight = 0;
 	}
 };
 
@@ -426,6 +449,9 @@ struct FglTFRuntimeMaterialsConfig
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "glTFRuntime")
 	FString Variant;
 
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "glTFRuntime")
+	bool bSkipLoad;
+
 	FglTFRuntimeMaterialsConfig()
 	{
 		CacheMode = EglTFRuntimeCacheMode::ReadWrite;
@@ -434,6 +460,7 @@ struct FglTFRuntimeMaterialsConfig
 		SpecularFactor = 0;
 		bDisableVertexColors = false;
 		bMaterialsOverrideMapInjectParams = false;
+		bSkipLoad = false;
 	}
 };
 
@@ -450,6 +477,9 @@ struct FglTFRuntimeStaticMeshConfig
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "glTFRuntime")
 	bool bBuildSimpleCollision;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "glTFRuntime")
+	bool bBuildComplexCollision;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "glTFRuntime")
 	TArray<FBox> BoxCollisions;
@@ -496,11 +526,31 @@ struct FglTFRuntimeStaticMeshConfig
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "glTFRuntime")
 	bool bGenerateStaticMeshDescription;
 
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "glTFRuntime")
+	TMap<FString, FString> CustomConfigMap;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "glTFRuntime")
+	TArray<UDataAsset*> CustomConfigObjects;
+
+	template<typename T>
+	T* GetCustomConfig() const
+	{
+		for (UDataAsset* Config : CustomConfigObjects)
+		{
+			if (Config->IsA<T>())
+			{
+				return Cast<T>(Config);
+			}
+		}
+		return nullptr;
+	}
+
 	FglTFRuntimeStaticMeshConfig()
 	{
 		CacheMode = EglTFRuntimeCacheMode::ReadWrite;
 		bReverseWinding = false;
 		bBuildSimpleCollision = false;
+		bBuildComplexCollision = false;
 		Outer = nullptr;
 		CollisionComplexity = ECollisionTraceFlag::CTF_UseDefault;
 		bAllowCPUAccess = false;
@@ -549,6 +599,35 @@ struct FglTFRuntimeProceduralMeshConfig
 };
 
 USTRUCT(BlueprintType)
+struct FglTFRuntimeLightConfig
+{
+	GENERATED_BODY()
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "glTFRuntime")
+	float DefaultAttenuationMultiplier;
+
+	FglTFRuntimeLightConfig()
+	{
+		DefaultAttenuationMultiplier = 1.0;
+	}
+};
+
+DECLARE_DYNAMIC_DELEGATE_RetVal_TwoParams(FString, FglTFRuntimeBoneRemapper, const int32, NodeIndex, const FString&, BoneName);
+
+USTRUCT(BlueprintType)
+struct FglTFRuntimeSkeletonBoneRemapperHook
+{
+	GENERATED_BODY()
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "glTFRuntime")
+	FglTFRuntimeBoneRemapper Remapper;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "glTFRuntime")
+	UObject* Context = nullptr;
+};
+
+
+USTRUCT(BlueprintType)
 struct FglTFRuntimeSkeletonConfig
 {
 	GENERATED_BODY()
@@ -595,6 +674,12 @@ struct FglTFRuntimeSkeletonConfig
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "glTFRuntime")
 	TMap<FString, FTransform> BonesDeltaTransformMap;
 
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "glTFRuntime")
+	FglTFRuntimeSkeletonBoneRemapperHook BoneRemapper;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "glTFRuntime")
+	bool bAppendNodeIndexOnNameCollision;
+	
 	FglTFRuntimeSkeletonConfig()
 	{
 		CacheMode = EglTFRuntimeCacheMode::ReadWrite;
@@ -605,6 +690,7 @@ struct FglTFRuntimeSkeletonConfig
 		CopyRotationsFrom = nullptr;
 		bSkipAlreadyExistentBoneNames = false;
 		bAssignUnmappedBonesToParent = false;
+		bAppendNodeIndexOnNameCollision = false;
 	}
 };
 
@@ -733,6 +819,9 @@ struct FglTFRuntimeSkeletalMeshConfig
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "glTFRuntime")
 	UPhysicsAsset* PhysicsAssetTemplate;
 
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "glTFRuntime")
+	bool bAddVirtualBones;
+
 	FglTFRuntimeSkeletalMeshConfig()
 	{
 		CacheMode = EglTFRuntimeCacheMode::ReadWrite;
@@ -752,6 +841,7 @@ struct FglTFRuntimeSkeletalMeshConfig
 		ShiftBounds = FVector::ZeroVector;
 		bUseHighPrecisionUVs = false;
 		PhysicsAssetTemplate = nullptr;
+		bAddVirtualBones = false;
 	}
 };
 
@@ -772,7 +862,7 @@ struct FglTFRuntimePathItem
 	}
 };
 
-DECLARE_DYNAMIC_DELEGATE_RetVal_ThreeParams(FString, FglTFRuntimeAnimationCurveRemapper, const FString&, CurveName, const FString&, Path, UObject*, Context);
+DECLARE_DYNAMIC_DELEGATE_RetVal_FourParams(FString, FglTFRuntimeAnimationCurveRemapper, const int32, NodeIndex, const FString&, CurveName, const FString&, Path, UObject*, Context);
 DECLARE_DYNAMIC_DELEGATE_RetVal_FourParams(FVector, FglTFRuntimeAnimationFrameTranslationRemapper, const FString&, CurveName, const int32, FrameNumber, FVector, Translation, UObject*, Context);
 DECLARE_DYNAMIC_DELEGATE_RetVal_FourParams(FRotator, FglTFRuntimeAnimationFrameRotationRemapper, const FString&, CurveName, const int32, FrameNumber, FRotator, Rotation, UObject*, Context);
 
@@ -934,6 +1024,7 @@ struct FglTFRuntimePrimitive
 	TMap<int32, int32> BonesCache;
 	FString MaterialName;
 	int64 AdditionalBufferView;
+	int32 Mode;
 
 	FglTFRuntimePrimitive()
 	{
@@ -1013,6 +1104,7 @@ struct FglTFRuntimeSkeletalMeshContext : public FGCObject
 		}
 #endif
 		SkeletalMesh = NewObject<USkeletalMesh>(Outer, NAME_None, Flags);
+		SkeletalMesh->NeverStream = true;
 		BoundingBox = FBox(EForceInit::ForceInitToZero);
 		SkinIndex = -1;
 	}
@@ -1022,7 +1114,7 @@ struct FglTFRuntimeSkeletalMeshContext : public FGCObject
 		return "FglTFRuntimeSkeletalMeshContext_Referencer";
 	}
 
-	void AddReferencedObjects(FReferenceCollector& Collector)
+	void AddReferencedObjects(FReferenceCollector& Collector) override
 	{
 		Collector.AddReferencedObject(SkeletalMesh);
 	}
@@ -1242,7 +1334,7 @@ struct FglTFRuntimeAudioEmitter
 	float Volume;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "glTFRuntime")
-	USoundWave* Sound;
+	USoundBase* Sound;
 
 	FglTFRuntimeAudioEmitter()
 	{
@@ -1259,6 +1351,24 @@ struct FglTFRuntimeAnimationCurve
 	TArray<FVector4> OutTangents;
 };
 
+USTRUCT(BlueprintType)
+struct FglTFRuntimeAudioConfig
+{
+	GENERATED_BODY()
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "glTFRuntime")
+	bool bLoop;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "glTFRuntime")
+	float Volume;
+
+	FglTFRuntimeAudioConfig()
+	{
+		bLoop = false;
+		Volume = 1.0f;
+	}
+};
+
 DECLARE_DYNAMIC_DELEGATE_OneParam(FglTFRuntimeStaticMeshAsync, UStaticMesh*, StaticMesh);
 DECLARE_DYNAMIC_DELEGATE_OneParam(FglTFRuntimeSkeletalMeshAsync, USkeletalMesh*, SkeletalMesh);
 
@@ -1268,6 +1378,7 @@ DECLARE_MULTICAST_DELEGATE_ThreeParams(FglTFRuntimeOnLoadedRefSkeleton, TSharedR
 DECLARE_MULTICAST_DELEGATE_ThreeParams(FglTFRuntimeOnCreatedPoseTracks, TSharedRef<FglTFRuntimeParser>, TMap<FString, FRawAnimSequenceTrack>&);
 DECLARE_MULTICAST_DELEGATE_SixParams(FglTFRuntimeOnTexturePixels, TSharedRef<FglTFRuntimeParser>, TSharedRef<FJsonObject>, TArray64<uint8>&, int32&, int32&, TArray64<uint8>&);
 DECLARE_MULTICAST_DELEGATE_FiveParams(FglTFRuntimeOnLoadedTexturePixels, TSharedRef<FglTFRuntimeParser>, TSharedRef<FJsonObject>, const int32, const int32, FColor*);
+DECLARE_MULTICAST_DELEGATE_ThreeParams(FglTFRuntimeOnFinalizedStaticMesh, TSharedRef<FglTFRuntimeParser>, UStaticMesh*, const FglTFRuntimeStaticMeshConfig&);
 
 /**
  *
@@ -1310,6 +1421,7 @@ public:
 	bool LoadNode(int32 NodeIndex, FglTFRuntimeNode& Node);
 	bool LoadNodeByName(const FString& NodeName, FglTFRuntimeNode& Node);
 	bool LoadNodesRecursive(const int32 NodeIndex, TArray<FglTFRuntimeNode>& Nodes);
+	bool LoadJointByName(const int64 RootBoneIndex, const FString& Name, FglTFRuntimeNode& Node);
 
 	bool LoadScenes(TArray<FglTFRuntimeScene>& Scenes);
 	bool LoadScene(int32 SceneIndex, FglTFRuntimeScene& Scene);
@@ -1334,9 +1446,9 @@ public:
 	UglTFRuntimeAnimationCurve* LoadNodeAnimationCurve(const int32 NodeIndex);
 	TArray<UglTFRuntimeAnimationCurve*> LoadAllNodeAnimationCurves(const int32 NodeIndex);
 
-	bool GetBuffer(int32 BufferIndex, FglTFRuntimeBlob& Blob);
-	bool GetBufferView(int32 BufferViewIndex, FglTFRuntimeBlob& Blob, int64& Stride);
-	bool GetAccessor(int32 AccessorIndex, int64& ComponentType, int64& Stride, int64& Elements, int64& ElementSize, int64& Count, bool& bNormalized, FglTFRuntimeBlob& Blob, const FglTFRuntimeBlob* AdditionalBufferView);
+	bool GetBuffer(const int32 BufferIndex, FglTFRuntimeBlob& Blob);
+	bool GetBufferView(const int32 BufferViewIndex, FglTFRuntimeBlob& Blob, int64& Stride);
+	bool GetAccessor(const int32 AccessorIndex, int64& ComponentType, int64& Stride, int64& Elements, int64& ElementSize, int64& Count, bool& bNormalized, FglTFRuntimeBlob& Blob, const FglTFRuntimeBlob* AdditionalBufferView);
 
 	bool GetAllNodes(TArray<FglTFRuntimeNode>& Nodes);
 
@@ -1400,11 +1512,13 @@ public:
 	bool GetBooleanFromExtras(const FString& Key, bool& Value) const;
 
 	bool LoadAudioEmitter(const int32 EmitterIndex, FglTFRuntimeAudioEmitter& Emitter);
+	ULightComponent* LoadPunctualLight(const int32 PunctualLightIndex, AActor* Actor, const FglTFRuntimeLightConfig& LightConfig);
 
 	TArray<FString> ExtensionsUsed;
 	TArray<FString> ExtensionsRequired;
 
 	bool LoadImage(const int32 ImageIndex, TArray64<uint8>& UncompressedBytes, int32& Width, int32& Height, const FglTFRuntimeImagesConfig& ImagesConfig);
+	bool LoadImageFromBlob(TArray64<uint8>& Blob, TSharedRef<FJsonObject> JsonImageObject, TArray64<uint8>& UncompressedBytes, int32& Width, int32& Height, const FglTFRuntimeImagesConfig& ImagesConfig);
 	UTexture2D* BuildTexture(UObject* Outer, const TArray<FglTFRuntimeMipMap>& Mips, const FglTFRuntimeImagesConfig& ImagesConfig, const FglTFRuntimeTextureSampler& Sampler);
 
 	TArray<FString> MaterialsVariants;
@@ -1413,7 +1527,9 @@ public:
 
 	static FVector4 CubicSpline(const float TC, const float T0, const float T1, const FVector4 Value0, const FVector4 OutTangent, const FVector4 Value1, const FVector4 InTangent);
 
-	UAnimSequence* CreateAnimationFromPose(USkeletalMesh* SkeletalMesh, const FglTFRuntimeSkeletalAnimationConfig& SkeletalAnimationConfig);
+	UAnimSequence* CreateAnimationFromPose(USkeletalMesh* SkeletalMesh, const int32 SkinIndex, const FglTFRuntimeSkeletalAnimationConfig& SkeletalAnimationConfig);
+
+	UAnimSequence* CreateSkeletalAnimationFromPath(USkeletalMesh* SkeletalMesh, const TArray<FglTFRuntimePathItem>& BonesPath, const TArray<FglTFRuntimePathItem>& MorphTargetsPath, const FglTFRuntimeSkeletalAnimationConfig& SkeletalAnimationConfig);
 
 	TArray<TSharedRef<FJsonObject>> GetMeshes() const;
 	TArray<TSharedRef<FJsonObject>> GetMeshPrimitives(TSharedRef<FJsonObject> Mesh) const;
@@ -1428,6 +1544,7 @@ public:
 	static FglTFRuntimeOnCreatedPoseTracks OnCreatedPoseTracks;
 	static FglTFRuntimeOnTexturePixels OnTexturePixels;
 	static FglTFRuntimeOnLoadedTexturePixels OnLoadedTexturePixels;
+	static FglTFRuntimeOnFinalizedStaticMesh OnFinalizedStaticMesh;
 
 	const FglTFRuntimeBlob* GetAdditionalBufferView(const int64 Index, const FString& Name) const;
 	
@@ -1480,6 +1597,20 @@ public:
 			});
 	}
 
+	TSharedPtr<FJsonObject> GetNodeExtensionObject(const int32 NodeIndex, const FString& ExtensionName);
+	TSharedPtr<FJsonObject> GetNodeObject(const int32 NodeIndex);
+
+	FString GetJsonObjectString(TSharedRef<FJsonObject> JsonObject, const FString& FieldName, const FString& DefaultValue);
+	double GetJsonObjectNumber(TSharedRef<FJsonObject> JsonObject, const FString& FieldName, const double DefaultValue);
+	int32 GetJsonObjectIndex(TSharedRef<FJsonObject> JsonObject, const FString& FieldName, const int32 DefaultValue);
+	int32 GetJsonExtensionObjectIndex(TSharedRef<FJsonObject> JsonObject, const FString& ExtensionName, const FString& FieldName, const int32 DefaultValue);
+	double GetJsonExtensionObjectNumber(TSharedRef<FJsonObject> JsonObject, const FString& ExtensionName, const FString& FieldName, const double DefaultValue);
+	TArray<int32> GetJsonExtensionObjectIndices(TSharedRef<FJsonObject> JsonObject, const FString& ExtensionName, const FString& FieldName);
+	TArray<double> GetJsonExtensionObjectNumbers(TSharedRef<FJsonObject> JsonObject, const FString& ExtensionName, const FString& FieldName);
+	TArray<TSharedRef<FJsonObject>> GetJsonObjectArrayOfObjects(TSharedRef<FJsonObject> JsonObject, const FString& FieldName);
+	FVector4 GetJsonObjectVector4(TSharedRef<FJsonObject> JsonObject, const FString& FieldName, const FVector4 DefaultValue);
+
+	bool GetRootBoneIndex(TSharedRef<FJsonObject> JsonSkinObject, int64& RootBoneIndex, TArray<int32>& Joints, const FglTFRuntimeSkeletonConfig& SkeletonConfig);
 protected:
 	TSharedRef<FJsonObject> Root;
 
@@ -1490,6 +1621,8 @@ protected:
 	TMap<int32, UTexture2D*> TexturesCache;
 
 	TMap<int32, TArray64<uint8>> BuffersCache;
+	TMap<int32, TArray64<uint8>> CompressedBufferViewsCache;
+	TMap<int32, int64> CompressedBufferViewsStridesCache;
 
 	TMap<UMaterialInterface*, FString> MaterialsNameCache;
 
@@ -1516,7 +1649,7 @@ protected:
 
 	bool FillReferenceSkeleton(TSharedRef<FJsonObject> JsonSkinObject, FReferenceSkeleton& RefSkeleton, TMap<int32, FName>& BoneMap, const FglTFRuntimeSkeletonConfig& SkeletonConfig);
 	bool FillFakeSkeleton(FReferenceSkeleton& RefSkeleton, TMap<int32, FName>& BoneMap, const FglTFRuntimeSkeletalMeshConfig& SkeletalMeshConfig);
-	bool TraverseJoints(FReferenceSkeletonModifier& Modifier, int32 Parent, FglTFRuntimeNode& Node, const TArray<int32>& Joints, TMap<int32, FName>& BoneMap, const TMap<int32, FMatrix>& InverseBindMatricesMap, const FglTFRuntimeSkeletonConfig& SkeletonConfig);
+	bool TraverseJoints(FReferenceSkeletonModifier& Modifier, const int32 RootIndex, int32 Parent, FglTFRuntimeNode& Node, const TArray<int32>& Joints, TMap<int32, FName>& BoneMap, const TMap<int32, FMatrix>& InverseBindMatricesMap, const FglTFRuntimeSkeletonConfig& SkeletonConfig);
 
 	bool GetMorphTargetNames(const int32 MeshIndex, TArray<FName>& MorphTargetNames);
 
@@ -1526,6 +1659,7 @@ protected:
 	int32 FindTopRoot(int32 NodeIndex);
 	bool HasRoot(int32 NodeIndex, int32 RootIndex);
 
+public:
 	bool CheckJsonIndex(TSharedRef<FJsonObject> JsonObject, const FString& FieldName, const int32 Index, TArray<TSharedRef<FJsonValue>>& JsonItems);
 	bool CheckJsonRootIndex(const FString FieldName, const int32 Index, TArray<TSharedRef<FJsonValue>>& JsonItems) { return CheckJsonIndex(Root, FieldName, Index, JsonItems); }
 	TSharedPtr<FJsonObject> GetJsonObjectFromIndex(TSharedRef<FJsonObject> JsonObject, const FString& FieldName, const int32 Index);
@@ -1535,17 +1669,11 @@ protected:
 	TArray<TSharedRef<FJsonObject>> GetJsonObjectArrayFromExtension(TSharedRef<FJsonObject> JsonObject, const FString& ExtensionName, const FString& FieldName);
 	TArray<TSharedRef<FJsonObject>> GetJsonObjectArrayFromRootExtension(const FString& ExtensionName, const FString& FieldName) { return GetJsonObjectArrayFromExtension(Root, ExtensionName, FieldName); }
 
-	FString GetJsonObjectString(TSharedRef<FJsonObject> JsonObject, const FString& FieldName, const FString& DefaultValue);
-	double GetJsonObjectNumber(TSharedRef<FJsonObject> JsonObject, const FString& FieldName, const double DefaultValue);
-	int32 GetJsonObjectIndex(TSharedRef<FJsonObject> JsonObject, const FString& FieldName, const int32 DefaultValue);
-	int32 GetJsonExtensionObjectIndex(TSharedRef<FJsonObject> JsonObject, const FString& ExtensionName, const FString& FieldName, const int32 DefaultValue);
-	double GetJsonExtensionObjectNumber(TSharedRef<FJsonObject> JsonObject, const FString& ExtensionName, const FString& FieldName, const double DefaultValue);
-	TArray<int32> GetJsonExtensionObjectIndices(TSharedRef<FJsonObject> JsonObject, const FString& ExtensionName, const FString& FieldName);
-	TArray<double> GetJsonExtensionObjectNumbers(TSharedRef<FJsonObject> JsonObject, const FString& ExtensionName, const FString& FieldName);
 
 	bool GetJsonObjectBytes(TSharedRef<FJsonObject> JsonObject, TArray64<uint8>& Bytes);
 	bool GetJsonObjectBool(TSharedRef<FJsonObject> JsonObject, const FString& FieldName, const bool DefaultValue);
 
+protected:
 	bool FillJsonMatrix(const TArray<TSharedPtr<FJsonValue>>* JsonMatrixValues, FMatrix& Matrix);
 
 	float FindBestFrames(const TArray<float>& FramesTimes, float WantedTime, int32& FirstIndex, int32& SecondIndex);
@@ -1562,6 +1690,8 @@ protected:
 	bool CanReadFromCache(const EglTFRuntimeCacheMode CacheMode) { return CacheMode == EglTFRuntimeCacheMode::Read || CacheMode == EglTFRuntimeCacheMode::ReadWrite; }
 	bool CanWriteToCache(const EglTFRuntimeCacheMode CacheMode) { return CacheMode == EglTFRuntimeCacheMode::Write || CacheMode == EglTFRuntimeCacheMode::ReadWrite; }
 
+	bool DecompressMeshOptimizer(const FglTFRuntimeBlob& Blob, const int64 Stride, const int64 Elements, const FString& Mode, const FString& Filter, TArray64<uint8>& UncompressedBytes);
+
 	FMatrix SceneBasis;
 	float SceneScale;
 
@@ -1573,6 +1703,20 @@ protected:
 	TArray<FString> Errors;
 
 	FString BaseDirectory;
+
+	TArray64<uint8> AsBlob;
+
+public:
+
+	const TArray64<uint8>& GetBlob() const { return AsBlob; }
+	TArray64<uint8>& GetBlob() { return AsBlob; }
+
+	FTransform RebaseTransform(const FTransform& Transform) const
+	{
+		FMatrix M = Transform.ToMatrixWithScale();
+		M.ScaleTranslation(FVector(SceneScale, SceneScale, SceneScale));
+		return FTransform(SceneBasis.Inverse() * M * SceneBasis);
+	}
 
 	template<typename T, typename Callback>
 	bool BuildFromAccessorField(TSharedRef<FJsonObject> JsonObject, const FString& Name, TArray<T>& Data, const TArray<int64>& SupportedElements, const TArray<int64>& SupportedTypes, bool bNormalized, Callback Filter, const int64 AdditionalBufferView)
@@ -1681,6 +1825,7 @@ protected:
 		FglTFRuntimeBlob Blob;
 		int64 ComponentType, Stride, Elements, ElementSize, Count;
 		bool bOverrideNormalized = false;
+
 		if (!GetAccessor(AccessorIndex, ComponentType, Stride, Elements, ElementSize, Count, bOverrideNormalized, Blob, GetAdditionalBufferView(AdditionalBufferView, Name)))
 		{
 			return false;
@@ -1717,7 +1862,6 @@ protected:
 			{
 				int8* Ptr = (int8*)&(Blob.Data[Index]);
 				Value = bNormalized ? FMath::Max(((float)(*Ptr)) / 127.f, -1.f) : *Ptr;
-
 			}
 			// UNSIGNED_BYTE
 			else if (ComponentType == 5121)
@@ -1761,20 +1905,28 @@ protected:
 		return BuildFromAccessorField(JsonObject, Name, Data, SupportedTypes, bNormalized, [&](T InValue) -> T {return InValue; }, AdditionalBufferView);
 	}
 
+
+
 	template<int32 Num, typename T>
 	bool GetJsonVector(const TArray<TSharedPtr<FJsonValue>>* JsonValues, T& Value)
 	{
 		if (JsonValues->Num() != Num)
+		{
 			return false;
+		}
 
 		for (int32 i = 0; i < Num; i++)
 		{
 			if (!(*JsonValues)[i]->TryGetNumber(Value[i]))
+			{
 				return false;
+			}
 		}
 
 		return true;
 	}
+
+protected:
 
 	bool MergePrimitives(TArray<FglTFRuntimePrimitive> SourcePrimitives, FglTFRuntimePrimitive& OutPrimitive);
 

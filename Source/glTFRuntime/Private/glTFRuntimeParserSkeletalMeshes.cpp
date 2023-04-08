@@ -1664,12 +1664,12 @@ UAnimSequence* FglTFRuntimeParser::LoadSkeletalAnimation(USkeletalMesh * Skeleta
 	*FrameRatePtr = FrameRate;
 #else
 	PRAGMA_DISABLE_DEPRECATION_WARNINGS
-		AnimSequence->SequenceLength = Duration;
+//		AnimSequence->GetController().SetPlayLength(Duration);
 	PRAGMA_ENABLE_DEPRECATION_WARNINGS
 #endif
 #else
 	AnimSequence->SetRawNumberOfFrame(NumFrames);
-	AnimSequence->SequenceLength = Duration;
+//	AnimSequence->GetController().SetPlayLength(Duration);
 #endif
 	AnimSequence->bEnableRootMotion = SkeletalAnimationConfig.bRootMotion;
 	AnimSequence->RootMotionRootLock = SkeletalAnimationConfig.RootMotionRootLock;
@@ -1931,7 +1931,7 @@ UAnimSequence* FglTFRuntimeParser::LoadSkeletalAnimation(USkeletalMesh * Skeleta
 #if WITH_EDITOR
 #if ENGINE_MAJOR_VERSION > 4
 	// hack for calling GenerateTransientData()
-	AnimSequence->GetDataModel()->PostDuplicate(false);
+	//AnimSequence->GetDataModel()->PostDuplicate(EDuplicateMode::Type::Normal);
 #else
 	AnimSequence->PostProcessSequence();
 #endif
@@ -1982,12 +1982,12 @@ UAnimSequence* FglTFRuntimeParser::CreateAnimationFromPose(USkeletalMesh * Skele
 	*FrameRatePtr = FrameRate;
 #else
 	PRAGMA_DISABLE_DEPRECATION_WARNINGS
-		AnimSequence->SequenceLength = Duration;
+	//	AnimSequence->GetController().SetPlayLength(Duration);
 	PRAGMA_ENABLE_DEPRECATION_WARNINGS
 #endif
 #else
 	AnimSequence->SetRawNumberOfFrame(NumFrames);
-	AnimSequence->SequenceLength = Duration;
+	//AnimSequence->GetController().SetPlayLength(Duration);
 #endif
 	AnimSequence->bEnableRootMotion = SkeletalAnimationConfig.bRootMotion;
 	AnimSequence->RootMotionRootLock = SkeletalAnimationConfig.RootMotionRootLock;
@@ -2117,7 +2117,7 @@ UAnimSequence* FglTFRuntimeParser::CreateAnimationFromPose(USkeletalMesh * Skele
 #if WITH_EDITOR
 #if ENGINE_MAJOR_VERSION > 4
 	// hack for calling GenerateTransientData()
-	AnimSequence->GetDataModel()->PostDuplicate(false);
+	//AnimSequence->GetDataModel()->PostDuplicate(EDuplicateMode::Type::Normal);
 #else
 	AnimSequence->PostProcessSequence();
 #endif
@@ -2242,12 +2242,12 @@ UAnimSequence* FglTFRuntimeParser::CreateSkeletalAnimationFromPath(USkeletalMesh
 	*FrameRatePtr = FrameRate;
 #else
 	PRAGMA_DISABLE_DEPRECATION_WARNINGS
-		AnimSequence->SequenceLength = Duration;
+		//AnimSequence->GetController().SetPlayLength(Duration);
 	PRAGMA_ENABLE_DEPRECATION_WARNINGS
 #endif
 #else
 	AnimSequence->SetRawNumberOfFrame(NumFrames);
-	AnimSequence->SequenceLength = Duration;
+	//AnimSequence->GetController().SetPlayLength(Duration);
 #endif
 	AnimSequence->bEnableRootMotion = SkeletalAnimationConfig.bRootMotion;
 	AnimSequence->RootMotionRootLock = SkeletalAnimationConfig.RootMotionRootLock;
@@ -2307,7 +2307,7 @@ UAnimSequence* FglTFRuntimeParser::CreateSkeletalAnimationFromPath(USkeletalMesh
 #if WITH_EDITOR
 #if ENGINE_MAJOR_VERSION > 4
 	// hack for calling GenerateTransientData()
-	AnimSequence->GetDataModel()->PostDuplicate(false);
+	//AnimSequence->GetDataModel()->PostDuplicate(EDuplicateMode::Type::Normal);
 #else
 	AnimSequence->PostProcessSequence();
 #endif

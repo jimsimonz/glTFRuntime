@@ -9,7 +9,7 @@ UglTFRuntimeSoundWave::UglTFRuntimeSoundWave()
 	RuntimeAudioOffset = 0;
 }
 
-int32 UglTFRuntimeSoundWave::GeneratePCMData(uint8* PCMData, const int32 SamplesNeeded)
+int32 UglTFRuntimeSoundWave::GeneratePCMData(uint8* PCMData, const int32 SamplesNeeded, const int32 Clock)
 {
 	if (RuntimeAudioData.Num() == 0)
 	{

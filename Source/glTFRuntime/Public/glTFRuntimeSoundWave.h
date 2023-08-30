@@ -17,7 +17,7 @@ class GLTFRUNTIME_API UglTFRuntimeSoundWave : public USoundWave
 public:
 	UglTFRuntimeSoundWave();
 
-	virtual int32 GeneratePCMData(uint8* PCMData, const int32 SamplesNeeded) override;
+	virtual int32 GeneratePCMData(uint8* PCMData, const int32 SamplesNeeded, const int32 Clock) override;
 	virtual bool HasCompressedData(FName Format, ITargetPlatform* TargetPlatform) const override { return false; }
 
 	virtual void SetRuntimeAudioData(const uint8* AudioData, const int64 AudioDataSize)

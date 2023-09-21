@@ -103,6 +103,14 @@ enum class EglTFRuntimePhysicsAssetAutoBodyCollisionType : uint8
 	Box
 };
 
+UENUM()
+enum class EglTFRuntimeRecursiveMode : uint8
+{
+	Ignore,
+	Node,
+	Tree
+};
+
 USTRUCT(BlueprintType)
 struct FglTFRuntimeBasisMatrix
 {
@@ -1517,12 +1525,14 @@ struct FglTFRuntimeMeshLOD
 	bool bHasNormals;
 	bool bHasTangents;
 	bool bHasUV;
+	bool bHasVertexColors;
 
 	FglTFRuntimeMeshLOD()
 	{
 		bHasNormals = false;
 		bHasTangents = false;
 		bHasUV = false;
+		bHasVertexColors = false;
 	}
 };
 
@@ -1949,7 +1959,7 @@ public:
 	static FORCEINLINE TSharedPtr<FglTFRuntimeParser> FromData(const TArray64<uint8> Data, const FglTFRuntimeConfig& LoaderConfig) { return FromData(Data.GetData(), Data.Num(), LoaderConfig); }
 
 	bool LoadMeshAsRuntimeLOD(const int32 MeshIndex, FglTFRuntimeMeshLOD& RuntimeLOD, const FglTFRuntimeMaterialsConfig& MaterialsConfig);
-	bool LoadSkinnedMeshRecursiveAsRuntimeLOD(const FString& NodeName, int32& SkinIndex, const TArray<FString>& ExcludeNodes, FglTFRuntimeMeshLOD& RuntimeLOD, const FglTFRuntimeMaterialsConfig& MaterialsConfig, const FglTFRuntimeSkeletonConfig& SkeletonConfig);
+	bool LoadSkinnedMeshRecursiveAsRuntimeLOD(const FString& NodeName, int32& SkinIndex, const TArray<FString>& ExcludeNodes, FglTFRuntimeMeshLOD& RuntimeLOD, const FglTFRuntimeMaterialsConfig& MaterialsConfig, const FglTFRuntimeSkeletonConfig& SkeletonConfig, const EglTFRuntimeRecursiveMode TransformApplyRecursiveMode);
 
 	UStaticMesh* LoadStaticMeshFromRuntimeLODs(const TArray<FglTFRuntimeMeshLOD>& RuntimeLODs, const FglTFRuntimeStaticMeshConfig& StaticMeshConfig);
 	void LoadStaticMeshFromRuntimeLODsAsync(const TArray<FglTFRuntimeMeshLOD>& RuntimeLODs, const FglTFRuntimeStaticMeshAsync& AsyncCallback, const FglTFRuntimeStaticMeshConfig& StaticMeshConfig);
@@ -1994,8 +2004,8 @@ public:
 
 	USkeletalMesh* LoadSkeletalMeshLODs(const TArray<int32>& MeshIndices, const int32 SkinIndex, const FglTFRuntimeSkeletalMeshConfig& SkeletalMeshConfig);
 
-	USkeletalMesh* LoadSkeletalMeshRecursive(const FString& NodeName, const int32 SkinIndex, const TArray<FString>& ExcludeNodes, const FglTFRuntimeSkeletalMeshConfig& SkeletalMeshConfig);
-	void LoadSkeletalMeshRecursiveAsync(const FString& NodeName, const int32 SkinIndex, const TArray<FString>& ExcludeNodes, const FglTFRuntimeSkeletalMeshAsync& AsyncCallback, const FglTFRuntimeSkeletalMeshConfig& SkeletalMeshConfig);
+	USkeletalMesh* LoadSkeletalMeshRecursive(const FString& NodeName, const int32 SkinIndex, const TArray<FString>& ExcludeNodes, const FglTFRuntimeSkeletalMeshConfig& SkeletalMeshConfig, const EglTFRuntimeRecursiveMode TransformApplyRecursiveMode);
+	void LoadSkeletalMeshRecursiveAsync(const FString& NodeName, const int32 SkinIndex, const TArray<FString>& ExcludeNodes, const FglTFRuntimeSkeletalMeshAsync& AsyncCallback, const FglTFRuntimeSkeletalMeshConfig& SkeletalMeshConfig, const EglTFRuntimeRecursiveMode TransformApplyRecursiveMode);
 
 	UglTFRuntimeAnimationCurve* LoadNodeAnimationCurve(const int32 NodeIndex);
 	TArray<UglTFRuntimeAnimationCurve*> LoadAllNodeAnimationCurves(const int32 NodeIndex);
@@ -2037,6 +2047,7 @@ public:
 
 	int32 GetNumMeshes() const;
 	int32 GetNumImages() const;
+	int32 GetNumAnimations() const;
 
 	FglTFRuntimeError OnError;
 	FglTFRuntimeOnStaticMeshCreated OnStaticMeshCreated;
@@ -2095,12 +2106,16 @@ public:
 
 	UAnimSequence* CreateSkeletalAnimationFromPath(USkeletalMesh* SkeletalMesh, const TArray<FglTFRuntimePathItem>& BonesPath, const TArray<FglTFRuntimePathItem>& MorphTargetsPath, const FglTFRuntimeSkeletalAnimationConfig& SkeletalAnimationConfig);
 
+	TArray<FString> GetAnimationsNames() const;
+
 	TArray<TSharedRef<FJsonObject>> GetMeshes() const;
 	TArray<TSharedRef<FJsonObject>> GetMeshPrimitives(TSharedRef<FJsonObject> Mesh) const;
 	TSharedPtr<FJsonObject> GetJsonObjectExtras(TSharedRef<FJsonObject> JsonObject) const;
 	TSharedPtr<FJsonObject> GetJsonObjectFromObject(TSharedRef<FJsonObject> JsonObject, const FString& Name) const;
 	TSharedPtr<FJsonObject> GetJsonObjectExtension(TSharedRef<FJsonObject> JsonObject, const FString& Name) const;
 	int64 GetJsonObjectIndex(TSharedRef<FJsonObject> JsonObject, const FString& Name) const;
+
+	TArray<TSharedRef<FJsonObject>> GetAnimations() const;
 
 	static FglTFRuntimeOnLoadedPrimitive OnPreLoadedPrimitive;
 	static FglTFRuntimeOnLoadedPrimitive OnLoadedPrimitive;

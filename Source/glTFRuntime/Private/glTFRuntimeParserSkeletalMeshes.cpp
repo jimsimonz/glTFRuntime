@@ -9,6 +9,7 @@
 #include "Animation/AnimData/IAnimationDataModel.h"
 #endif
 #endif
+#include "Animation/PoseAsset.h"
 #include "Components/SkeletalMeshComponent.h"
 #include "Rendering/SkeletalMeshLODModel.h"
 #include "Rendering/SkeletalMeshModel.h"
@@ -1773,7 +1774,6 @@ UAnimSequence* FglTFRuntimeParser::LoadSkeletalAnimationByName(USkeletalMesh* Sk
 
 UAnimSequence* FglTFRuntimeParser::LoadNodeSkeletalAnimation(USkeletalMesh* SkeletalMesh, const int32 NodeIndex, const FglTFRuntimeSkeletalAnimationConfig& SkeletalAnimationConfig)
 {
-
 	if (!SkeletalMesh)
 	{
 		return nullptr;
@@ -1854,6 +1854,102 @@ UAnimSequence* FglTFRuntimeParser::LoadNodeSkeletalAnimation(USkeletalMesh* Skel
 	return nullptr;
 }
 
+TMap<FString, UAnimSequence*> FglTFRuntimeParser::LoadNodeSkeletalAnimationsMap(USkeletalMesh* SkeletalMesh, const int32 NodeIndex, const FglTFRuntimeSkeletalAnimationConfig& SkeletalAnimationConfig)
+{
+	TMap<FString, UAnimSequence*> SkeletalAnimationsMap;
+
+	if (!SkeletalMesh)
+	{
+		return SkeletalAnimationsMap;
+	}
+
+	FglTFRuntimeNode Node;
+	if (!LoadNode(NodeIndex, Node))
+	{
+		return SkeletalAnimationsMap;
+	}
+
+	TArray<int32> Joints;
+
+	// this could be a static mesh read as a skeletal one...
+	if (Node.SkinIndex > INDEX_NONE)
+	{
+		TSharedPtr<FJsonObject> JsonSkinObject = GetJsonObjectFromRootIndex("skins", Node.SkinIndex);
+		if (!JsonSkinObject)
+		{
+			AddError("LoadNodeSkeletalAnimation()", "No skins defined in the asset");
+			return SkeletalAnimationsMap;
+		}
+
+		const TArray<TSharedPtr<FJsonValue>>* JsonJoints;
+		if (!JsonSkinObject->TryGetArrayField("joints", JsonJoints))
+		{
+			AddError("LoadNodeSkeletalAnimation()", "No joints defined in the skin");
+			return SkeletalAnimationsMap;
+		}
+
+		for (TSharedPtr<FJsonValue> JsonJoint : (*JsonJoints))
+		{
+			int64 JointIndex;
+			if (!JsonJoint->TryGetNumber(JointIndex))
+			{
+				return SkeletalAnimationsMap;
+			}
+			Joints.Add(JointIndex);
+		}
+	}
+
+	const TArray<TSharedPtr<FJsonValue>>* JsonAnimations;
+	if (!Root->TryGetArrayField("animations", JsonAnimations))
+	{
+		return SkeletalAnimationsMap;
+	}
+
+	for (int32 JsonAnimationIndex = 0; JsonAnimationIndex < JsonAnimations->Num(); JsonAnimationIndex++)
+	{
+		TSharedPtr<FJsonObject> JsonAnimationObject = (*JsonAnimations)[JsonAnimationIndex]->AsObject();
+		if (!JsonAnimationObject)
+		{
+			continue;
+		}
+
+		FString AnimationName;
+		if (!JsonAnimationObject->TryGetStringField("name", AnimationName))
+		{
+			AnimationName = FString::Printf(TEXT("Animation_%d"), JsonAnimationIndex);
+		}
+
+		float Duration;
+		TMap<FString, FRawAnimSequenceTrack> Tracks;
+		TMap<FName, TArray<TPair<float, float>>> MorphTargetCurves;
+		bool bAnimationFound = false;
+		if (!LoadSkeletalAnimation_Internal(JsonAnimationObject.ToSharedRef(), Tracks, MorphTargetCurves, Duration, SkeletalAnimationConfig, [&Joints, &bAnimationFound, NodeIndex](const FglTFRuntimeNode& Node) -> bool
+			{
+				if (!bAnimationFound)
+				{
+					bAnimationFound = (Node.Index == NodeIndex) || Joints.Contains(Node.Index);
+				}
+				return true;
+			}))
+		{
+			continue;
+		}
+
+		if (bAnimationFound || MorphTargetCurves.Num() > 0)
+		{
+			// this is very inefficient as we parse the tracks twice
+			// TODO: refactor it
+			UAnimSequence* NewAnimation = LoadSkeletalAnimation(SkeletalMesh, JsonAnimationIndex, SkeletalAnimationConfig);
+			if (NewAnimation)
+			{
+				UAnimSequence*& AnimationSlot = SkeletalAnimationsMap.FindOrAdd(AnimationName);
+				AnimationSlot = NewAnimation;
+			}
+		}
+	}
+
+	return SkeletalAnimationsMap;
+}
 
 UAnimSequence* FglTFRuntimeParser::LoadSkeletalAnimation(USkeletalMesh* SkeletalMesh, const int32 AnimationIndex, const FglTFRuntimeSkeletalAnimationConfig& SkeletalAnimationConfig)
 {
@@ -3613,6 +3709,8 @@ USkeletalMesh* FglTFRuntimeParser::LoadSkeletalMeshFromRuntimeLODs(const TArray<
 
 const FBox& FglTFRuntimeSkeletalMeshContext::GetBoneBox(const int32 BoneIndex)
 {
+	// unfortunately we need access to SkinWeightVertexBuffer.GetBoneIndex (and it is not available in 4.25)
+#if ENGINE_MAJOR_VERSION >= 5 || ENGINE_MINOR_VERSION >= 26
 	if (PerBoneBoundingBoxCache.Contains(BoneIndex))
 	{
 		return PerBoneBoundingBoxCache[BoneIndex];
@@ -3649,4 +3747,10 @@ const FBox& FglTFRuntimeSkeletalMeshContext::GetBoneBox(const int32 BoneIndex)
 	}
 
 	return PerBoneBoundingBoxCache[BoneIndex];
+#else
+	// dummy logic
+	FBox& Box = PerBoneBoundingBoxCache.Add(BoneIndex);
+	Box.Init();
+	return PerBoneBoundingBoxCache[BoneIndex];
+#endif
 }

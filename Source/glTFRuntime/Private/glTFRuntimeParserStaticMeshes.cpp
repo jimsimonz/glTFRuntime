@@ -28,7 +28,11 @@ FglTFRuntimeStaticMeshContext::FglTFRuntimeStaticMeshContext(TSharedRef<FglTFRun
 {
 	StaticMesh = NewObject<UStaticMesh>(StaticMeshConfig.Outer ? StaticMeshConfig.Outer : GetTransientPackage(), NAME_None, RF_Public);
 #if PLATFORM_ANDROID || PLATFORM_IOS
+#if ENGINE_MAJOR_VERSION >= 5 && ENGINE_MINOR_VERSION >= 4
+	StaticMesh->bAllowCPUAccess = StaticMeshConfig.bAllowCPUAccess;
+#else
 	StaticMesh->bAllowCPUAccess = false;
+#endif
 #else
 	StaticMesh->bAllowCPUAccess = StaticMeshConfig.bAllowCPUAccess;
 #endif
@@ -142,8 +146,7 @@ UStaticMesh* FglTFRuntimeParser::LoadStaticMesh_Internal(TSharedRef<FglTFRuntime
 		int32 NumUVs = 1;
 		FVector PivotDelta = FVector::ZeroVector;
 
-		int32 NumVertexInstancesPerLOD = 0;
-		int32 NumVertexPerLOD = 0;
+		int32 NumVerticesToBuildPerLOD = 0;
 
 		for (const FglTFRuntimePrimitive& Primitive : LOD->Primitives)
 		{
@@ -157,13 +160,11 @@ UStaticMesh* FglTFRuntimeParser::LoadStaticMesh_Internal(TSharedRef<FglTFRuntime
 				bHasVertexColors = true;
 			}
 
-			NumVertexInstancesPerLOD += Primitive.Indices.Num();
-
-			NumVertexPerLOD += Primitive.bHasIndices ? Primitive.Positions.Num() : Primitive.Indices.Num();
+			NumVerticesToBuildPerLOD += Primitive.bHasIndices ? Primitive.Positions.Num() : Primitive.Indices.Num();
 		}
 
 		TArray<FStaticMeshBuildVertex> StaticMeshBuildVertices;
-		StaticMeshBuildVertices.AddUninitialized(NumVertexPerLOD);
+		StaticMeshBuildVertices.AddUninitialized(NumVerticesToBuildPerLOD);
 
 		FBox BoundingBox;
 		BoundingBox.Init();
@@ -301,9 +302,9 @@ UStaticMesh* FglTFRuntimeParser::LoadStaticMesh_Internal(TSharedRef<FglTFRuntime
 				ParallelFor(NumVertexInstancesPerSection, [&](const int32 VertexInstanceSectionIndex)
 					{
 						uint32 VertexIndex = Primitive.Indices[VertexInstanceSectionIndex];
-						LODIndices[VertexInstanceBaseIndex + VertexInstanceSectionIndex] = VertexInstanceBaseIndex + VertexInstanceSectionIndex;
+						LODIndices[VertexInstanceBaseIndex + VertexInstanceSectionIndex] = VertexBaseIndex + VertexInstanceSectionIndex;
 
-						FStaticMeshBuildVertex& StaticMeshVertex = StaticMeshBuildVertices[VertexInstanceBaseIndex + VertexInstanceSectionIndex];
+						FStaticMeshBuildVertex& StaticMeshVertex = StaticMeshBuildVertices[VertexBaseIndex + VertexInstanceSectionIndex];
 
 #if ENGINE_MAJOR_VERSION > 4
 						StaticMeshVertex.Position = FVector3f(GetSafeValue(Primitive.Positions, VertexIndex, FVector::ZeroVector, bMissingIgnore));
@@ -662,7 +663,27 @@ UStaticMesh* FglTFRuntimeParser::LoadStaticMesh_Internal(TSharedRef<FglTFRuntime
 			StaticMeshContext->BoundingBoxAndSphere.Origin -= PivotDelta;
 		}
 
-		LODResources.VertexBuffers.PositionVertexBuffer.Init(StaticMeshBuildVertices, StaticMesh->bAllowCPUAccess);
+		const int64 PositionsSize = StaticMeshBuildVertices.Num() * sizeof(FStaticMeshBuildVertex);
+		// special (slower) logic for huge meshes (data size > 2GB)
+		if (PositionsSize > MAX_int32)
+		{
+#if ENGINE_MAJOR_VERSION >= 5
+			TArray<FVector3f> Positions;
+#else
+			TArray<FVector> Positions;
+#endif
+			Positions.AddUninitialized(StaticMeshBuildVertices.Num());
+			for (int32 BuildVertexIndex = 0; BuildVertexIndex < StaticMeshBuildVertices.Num(); BuildVertexIndex++)
+			{
+				Positions[BuildVertexIndex] = StaticMeshBuildVertices[BuildVertexIndex].Position;
+			}
+			LODResources.VertexBuffers.PositionVertexBuffer.Init(Positions, StaticMesh->bAllowCPUAccess);
+		}
+		else
+		{
+			LODResources.VertexBuffers.PositionVertexBuffer.Init(StaticMeshBuildVertices, StaticMesh->bAllowCPUAccess);
+		}
+
 		LODResources.VertexBuffers.StaticMeshVertexBuffer.SetUseFullPrecisionUVs(bHighPrecisionUVs || StaticMeshConfig.bUseHighPrecisionUVs);
 #if ENGINE_MAJOR_VERSION >= 5 && ENGINE_MINOR_VERSION >= 3
 		LODResources.VertexBuffers.StaticMeshVertexBuffer.Init(0, NumUVs, StaticMesh->bAllowCPUAccess);

@@ -1447,6 +1447,13 @@ void UglTFRuntimeAsset::LoadStaticMeshFromRuntimeLODsAsync(const TArray<FglTFRun
 	Parser->LoadStaticMeshFromRuntimeLODsAsync(RuntimeLODs, AsyncCallback, StaticMeshConfig);
 }
 
+void UglTFRuntimeAsset::LoadSkeletalMeshFromRuntimeLODsAsync(const TArray<FglTFRuntimeMeshLOD>& RuntimeLODs, const int32 SkinIndex, const FglTFRuntimeSkeletalMeshAsync& AsyncCallback, const FglTFRuntimeSkeletalMeshConfig& SkeletalMeshConfig)
+{
+	GLTF_CHECK_PARSER_VOID();
+
+	Parser->LoadSkeletalMeshFromRuntimeLODsAsync(RuntimeLODs, SkinIndex, AsyncCallback, SkeletalMeshConfig);
+}
+
 float UglTFRuntimeAsset::GetDownloadTime() const
 {
 	GLTF_CHECK_PARSER(0);
@@ -1473,4 +1480,11 @@ TArray<FString> UglTFRuntimeAsset::GetErrors() const
 	GLTF_CHECK_PARSER(TArray<FString>());
 
 	return Parser->GetErrors();
+}
+
+bool UglTFRuntimeAsset::MeshHasMorphTargets(const int32 MeshIndex) const
+{
+	GLTF_CHECK_PARSER(false);
+
+	return Parser->MeshHasMorphTargets(MeshIndex);
 }

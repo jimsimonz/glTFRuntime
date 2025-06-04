@@ -9,9 +9,14 @@ UglTFRuntimeSoundWave::UglTFRuntimeSoundWave()
 	bProcedural = true;
 	RuntimeAudioOffset = 0;
 }
-
+#ifdef ALIVEIN_TECH_FORK
 int32 UglTFRuntimeSoundWave::GeneratePCMData(uint8* PCMData, const int32 SamplesNeeded, const int32 Clock)
 {
+#else
+int32 UglTFRuntimeSoundWave::GeneratePCMData(uint8* PCMData, const int32 SamplesNeeded)
+{
+	const int32 Clock = 0;
+#endif
 	if (RuntimeAudioData.Num() == 0)
 	{
 		return 0;

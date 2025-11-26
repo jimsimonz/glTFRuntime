@@ -314,7 +314,16 @@ bool UglTFRuntimeAsset::LoadFromString(const FString& JsonData, const FglTFRunti
 		return false;
 	}
 
-	Parser = FglTFRuntimeParser::FromString(JsonData, LoaderConfig, nullptr);
+	if (LoaderConfig.bAsBlob)
+	{
+		FTCHARToUTF8 UTF8String(*JsonData);
+		Parser = FglTFRuntimeParser::FromData(reinterpret_cast<const uint8*>(UTF8String.Get()), UTF8String.Length(), LoaderConfig);
+	}
+	else
+	{
+		Parser = FglTFRuntimeParser::FromString(JsonData, LoaderConfig, nullptr);
+	}
+
 	if (Parser)
 	{
 		FScriptDelegate Delegate;
@@ -385,6 +394,18 @@ TArray<FglTFRuntimeScene> UglTFRuntimeAsset::GetScenes()
 		return TArray<FglTFRuntimeScene>();
 	}
 	return Scenes;
+}
+
+bool UglTFRuntimeAsset::GetDefaultScene(FglTFRuntimeScene& DefaultScene)
+{
+	GLTF_CHECK_PARSER(false);
+	const int32 SceneIndex = Parser->GetDefaultSceneIndex();
+	if (SceneIndex <= INDEX_NONE)
+	{
+		Parser->AddError("UglTFRuntimeAsset::GetDefaultScene()", "Unable to retrieve Default Scene from glTF Asset.");
+		return false;
+	}
+	return Parser->LoadScene(SceneIndex, DefaultScene);
 }
 
 TArray<FglTFRuntimeNode> UglTFRuntimeAsset::GetNodes()
@@ -625,11 +646,39 @@ UAnimSequence* UglTFRuntimeAsset::LoadSkeletalAnimation(USkeletalMesh* SkeletalM
 	return Parser->LoadSkeletalAnimation(SkeletalMesh, AnimationIndex, SkeletalAnimationConfig);
 }
 
-UAnimSequence* UglTFRuntimeAsset::LoadSkeletalAnimationByName(USkeletalMesh* SkeletalMesh, const FString& AnimationName, const FglTFRuntimeSkeletalAnimationConfig& SkeletalAnimationConfig)
+UAnimSequence* UglTFRuntimeAsset::LoadSkeletalAnimationByName(USkeletalMesh* SkeletalMesh, const FString& AnimationName, const FglTFRuntimeSkeletalAnimationConfig& SkeletalAnimationConfig, const bool bCaseSensitive)
 {
 	GLTF_CHECK_PARSER(nullptr);
 
-	return Parser->LoadSkeletalAnimationByName(SkeletalMesh, AnimationName, SkeletalAnimationConfig);
+	return Parser->LoadSkeletalAnimationByName(SkeletalMesh, AnimationName, SkeletalAnimationConfig, bCaseSensitive);
+}
+
+UAnimSequence* UglTFRuntimeAsset::LoadSkeletalAnimationOnSkeleton(USkeleton* Skeleton, const int32 AnimationIndex, const FglTFRuntimeSkeletalAnimationConfig& SkeletalAnimationConfig)
+{
+	GLTF_CHECK_PARSER(nullptr);
+
+	return Parser->LoadSkeletalAnimationOnSkeleton(Skeleton, AnimationIndex, SkeletalAnimationConfig);
+}
+
+UAnimSequence* UglTFRuntimeAsset::LoadSkeletalAnimationByNameOnSkeleton(USkeleton* Skeleton, const FString& AnimationName, const FglTFRuntimeSkeletalAnimationConfig& SkeletalAnimationConfig, const bool bCaseSensitive)
+{
+	GLTF_CHECK_PARSER(nullptr);
+
+	return Parser->LoadSkeletalAnimationByNameOnSkeleton(Skeleton, AnimationName, SkeletalAnimationConfig, bCaseSensitive);
+}
+
+UAnimSequence* UglTFRuntimeAsset::LoadAndMergeSkeletalAnimations(USkeletalMesh* SkeletalMesh, const TArray<int32> AnimationIndices, const bool bRandomize, const FglTFRuntimeSkeletalAnimationConfig& SkeletalAnimationConfig)
+{
+	GLTF_CHECK_PARSER(nullptr);
+
+	return Parser->LoadAndMergeSkeletalAnimations(SkeletalMesh, AnimationIndices, bRandomize, SkeletalAnimationConfig);
+}
+
+UAnimSequence* UglTFRuntimeAsset::LoadAndMergeSkeletalAnimationsByName(USkeletalMesh* SkeletalMesh, const TArray<FString>& AnimationNames, const bool bIgnoreNonExistent, const bool bRandomize, const FglTFRuntimeSkeletalAnimationConfig& SkeletalAnimationConfig)
+{
+	GLTF_CHECK_PARSER(nullptr);
+
+	return Parser->LoadAndMergeSkeletalAnimationsByName(SkeletalMesh, AnimationNames, bIgnoreNonExistent, bRandomize, SkeletalAnimationConfig);
 }
 
 bool UglTFRuntimeAsset::BuildTransformFromNodeBackward(const int32 NodeIndex, FTransform& Transform)
@@ -821,6 +870,24 @@ TArray<FString> UglTFRuntimeAsset::GetObjectKeysFromPath(const TArray<FglTFRunti
 {
 	GLTF_CHECK_PARSER({});
 	return Parser->GetJSONObjectKeysFromPath(Path, bFound);
+}
+
+TArray<FString> UglTFRuntimeAsset::GetStringArrayFromPath(const TArray<FglTFRuntimePathItem>& Path, bool& bFound) const
+{
+	GLTF_CHECK_PARSER({});
+	return Parser->GetJSONStringArrayFromPath(Path, bFound);
+}
+
+TMap<FString, FString> UglTFRuntimeAsset::GetStringMapFromPath(const TArray<FglTFRuntimePathItem>& Path, bool& bFound) const
+{
+	GLTF_CHECK_PARSER({});
+	return Parser->GetJSONStringMapFromPath(Path, bFound);
+}
+
+FString UglTFRuntimeAsset::GetJsonFromPath(const TArray<FglTFRuntimePathItem>& Path, bool& bFound) const
+{
+	GLTF_CHECK_PARSER("");
+	return Parser->GetJSONSerializedStringFromPath(Path, bFound);
 }
 
 FVector4 UglTFRuntimeAsset::GetVectorFromPath(const TArray<FglTFRuntimePathItem>& Path, bool& bFound) const
@@ -1201,6 +1268,47 @@ UTexture2D* UglTFRuntimeAsset::LoadMipsFromBlob(const FglTFRuntimeImagesConfig& 
 	return Parser->BuildTexture(this, Mips, ImagesConfig, FglTFRuntimeTextureSampler());
 }
 
+void UglTFRuntimeAsset::LoadMipsFromBlobAsync(const FglTFRuntimeImagesConfig& ImagesConfig, const FglTFRuntimeTexture2DAsync& AsyncCallback)
+{
+	Async(EAsyncExecution::Thread, [this, ImagesConfig, AsyncCallback]()
+		{
+			if (!Parser)
+			{
+				FGraphEventRef Task = FFunctionGraphTask::CreateAndDispatchWhenReady([&, AsyncCallback]()
+					{
+						AsyncCallback.ExecuteIfBound(nullptr);
+					}, TStatId(), nullptr, ENamedThreads::GameThread);
+				FTaskGraphInterface::Get().WaitUntilTaskCompletes(Task);
+				return;
+			}
+
+			TArray<FglTFRuntimeMipMap> Mips;
+			FglTFRuntimeParser::OnTextureMips.Broadcast(Parser.ToSharedRef(), -1, MakeShared<FJsonObject>(), MakeShared<FJsonObject>(), Parser->GetBlob(), Mips, ImagesConfig);
+			// if no Mips have been loaded, attempt parsing a DDS asset
+			if (Mips.Num() == 0)
+			{
+				if (FglTFRuntimeDDS::IsDDS(Parser->GetBlob()))
+				{
+					FglTFRuntimeDDS DDS(Parser->GetBlob());
+					DDS.LoadMips(-1, Mips, 0, ImagesConfig);
+				}
+			}
+
+			FGraphEventRef Task = FFunctionGraphTask::CreateAndDispatchWhenReady([&, AsyncCallback]()
+				{
+					if (Mips.Num() > 0)
+					{
+						AsyncCallback.ExecuteIfBound(Parser->BuildTexture(this, Mips, ImagesConfig, FglTFRuntimeTextureSampler()));
+					}
+					else
+					{
+						AsyncCallback.ExecuteIfBound(nullptr);
+					}
+				}, TStatId(), nullptr, ENamedThreads::GameThread);
+			FTaskGraphInterface::Get().WaitUntilTaskCompletes(Task);
+		});
+}
+
 void UglTFRuntimeAsset::LoadCubeMapFromBlobAsync(const bool bSpherical, const bool bAutoRotate, const FglTFRuntimeTextureCubeAsync& AsyncCallback, const FglTFRuntimeImagesConfig& ImagesConfig)
 {
 	Async(EAsyncExecution::Thread, [this, bSpherical, bAutoRotate, ImagesConfig, AsyncCallback]()
@@ -1537,6 +1645,38 @@ FString UglTFRuntimeAsset::GetGenerator() const
 	return Parser->GetGenerator();
 }
 
+TMap<FString, FString> UglTFRuntimeAsset::GetAssetMeta() const
+{
+	GLTF_CHECK_PARSER({});
+
+	TMap<FString, FString> Meta;
+
+	TSharedPtr<FJsonObject> JsonObject = Parser->GetAssetMeta();
+
+	if (JsonObject)
+	{
+		for (const TPair<FString, TSharedPtr<FJsonValue>>& Pair : JsonObject->Values)
+		{
+			if (!Pair.Value.IsValid())
+			{
+				Meta.Add(Pair.Key, "");
+				continue;
+			}
+
+			FString Value;
+			if (!Pair.Value->TryGetString(Value))
+			{
+				Meta.Add(Pair.Key, "");
+				continue;
+			}
+
+			Meta.Add(Pair.Key, Value);
+		}
+	}
+
+	return Meta;
+}
+
 void UglTFRuntimeAsset::ClearCache()
 {
 	if (Parser)
@@ -1620,4 +1760,24 @@ FString UglTFRuntimeAsset::GetBaseFilename() const
 	GLTF_CHECK_PARSER("");
 
 	return Parser->GetBaseFilename();
+}
+
+UTexture2D* UglTFRuntimeAsset::LoadTexture(const int32 TextureIndex, const FglTFRuntimeMaterialsConfig& MaterialsConfig)
+{
+	GLTF_CHECK_PARSER(nullptr);
+
+	TArray<FglTFRuntimeMipMap> Mips;
+	FglTFRuntimeTextureSampler Sampler;
+	UTexture2D* Texture = Parser->LoadTexture(TextureIndex, Mips, MaterialsConfig.ImagesConfig.bSRGB, MaterialsConfig, Sampler);
+	if (Texture)
+	{
+		return Texture;
+	}
+
+	if (Mips.Num() > 0)
+	{
+		return Parser->BuildTexture(GetTransientPackage(), Mips, MaterialsConfig.ImagesConfig, Sampler);
+	}
+
+	return nullptr;
 }

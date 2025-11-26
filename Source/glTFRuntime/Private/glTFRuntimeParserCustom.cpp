@@ -1,6 +1,8 @@
-// Copyright 2021-2022, Roberto De Ioris.
+// Copyright 2021-2025, Roberto De Ioris.
 
 #include "glTFRuntimeParser.h"
+#include "Serialization/JsonSerializer.h"
+#include "Serialization/JsonWriter.h"
 
 TSharedPtr<FJsonValue> FglTFRuntimeParser::GetJSONObjectFromRelativePath(TSharedRef<FJsonObject> JsonObject, const TArray<FglTFRuntimePathItem>& Path)
 {
@@ -84,6 +86,24 @@ FString FglTFRuntimeParser::GetJSONStringFromPath(const TArray<FglTFRuntimePathI
 	return ReturnValue;
 }
 
+FString FglTFRuntimeParser::GetJSONSerializedStringFromPath(const TArray<FglTFRuntimePathItem>& Path, bool& bFound) const
+{
+	FString Json = "";
+	bFound = false;
+
+	TSharedPtr<FJsonValue> CurrentObject = GetJSONObjectFromPath(Path);
+	if (!CurrentObject)
+	{
+		return Json;
+	}
+
+	bFound = true;
+
+	TSharedRef<TJsonWriter<>> JsonWriter = TJsonWriterFactory<>::Create(&Json);
+	FJsonSerializer::Serialize(CurrentObject, "", JsonWriter);
+
+	return Json;
+}
 
 double FglTFRuntimeParser::GetJSONNumberFromPath(const TArray<FglTFRuntimePathItem>& Path, bool& bFound) const
 {
@@ -184,4 +204,72 @@ TArray<FString> FglTFRuntimeParser::GetJSONObjectKeysFromPath(const TArray<FglTF
 	}
 
 	return Keys;
+}
+
+TArray<FString> FglTFRuntimeParser::GetJSONStringArrayFromPath(const TArray<FglTFRuntimePathItem>& Path, bool& bFound) const
+{
+	bFound = false;
+	TArray<FString> Strings;
+
+	TSharedPtr<FJsonValue> CurrentObject = GetJSONObjectFromPath(Path);
+	if (CurrentObject)
+	{
+		const TArray<TSharedPtr<FJsonValue>>* IsArray = nullptr;
+		bFound = CurrentObject->TryGetArray(IsArray);
+		if (!bFound)
+		{
+			return {};
+		}
+
+		for (int32 Index = 0; Index < IsArray->Num(); Index++)
+		{
+			FString Value;
+			if ((*IsArray)[Index]->TryGetString(Value))
+			{
+				Strings.Add(Value);
+			}
+			else
+			{
+				Strings.Add("");
+			}
+		}
+
+	}
+
+	return Strings;
+}
+
+TMap<FString, FString> FglTFRuntimeParser::GetJSONStringMapFromPath(const TArray<FglTFRuntimePathItem>& Path, bool& bFound) const
+{
+	bFound = false;
+	TMap<FString, FString> StringMap;
+
+	TSharedPtr<FJsonValue> CurrentObject = GetJSONObjectFromPath(Path);
+	if (CurrentObject)
+	{
+		const TSharedPtr<FJsonObject>* JsonObject = nullptr;
+		if (CurrentObject->TryGetObject(JsonObject))
+		{
+			bFound = true;
+			for (const TPair<FString, TSharedPtr<FJsonValue>>& Pair : (*JsonObject)->Values)
+			{
+				if (!Pair.Value.IsValid())
+				{
+					StringMap.Add(Pair.Key, "");
+					continue;
+				}
+
+				FString Value;
+				if (!Pair.Value->TryGetString(Value))
+				{
+					StringMap.Add(Pair.Key, "");
+					continue;
+				}
+
+				StringMap.Add(Pair.Key, Value);
+			}
+		}
+	}
+
+	return StringMap;
 }

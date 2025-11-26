@@ -75,7 +75,7 @@ UMaterialInterface* FglTFRuntimeParser::LoadMaterial_Internal(const int32 Index,
 	{
 		RuntimeMaterial.MaterialType = EglTFRuntimeMaterialType::TwoSidedTranslucent;
 	}
-	if (RuntimeMaterial.bMasked && RuntimeMaterial.bTwoSided)
+	else if (RuntimeMaterial.bMasked && RuntimeMaterial.bTwoSided)
 	{
 		RuntimeMaterial.MaterialType = EglTFRuntimeMaterialType::TwoSidedMasked;
 	}
@@ -400,7 +400,11 @@ UTexture2D* FglTFRuntimeParser::BuildTexture(UObject* Outer, const TArray<FglTFR
 
 #if !WITH_EDITOR
 		// this is a hack for allowing texture streaming without messing around with deriveddata
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 7
+		Mip->BulkData.SetBulkDataFlags(BULKDATA_PayloadInSeparateFile);
+#else
 		Mip->BulkData.SetBulkDataFlags(BULKDATA_PayloadInSeperateFile);
+#endif
 #endif
 		Mip->BulkData.Lock(LOCK_READ_WRITE);
 
@@ -455,7 +459,10 @@ UTexture2D* FglTFRuntimeParser::BuildTexture(UObject* Outer, const TArray<FglTFR
 
 	Texture->UpdateResource();
 
-	TexturesCache.Add(Mips[0].TextureIndex, Texture);
+	if (Mips[0].TextureIndex >= 0)
+	{
+		TexturesCache.Add(Mips[0].TextureIndex, Texture);
+	}
 
 	FillAssetUserData(Mips[0].TextureIndex, Texture);
 
@@ -512,7 +519,11 @@ UVolumeTexture* FglTFRuntimeParser::BuildVolumeTexture(UObject* Outer, const TAr
 
 #if !WITH_EDITOR
 		// this is a hack for allowing texture streaming without messing around with deriveddata
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 7
+		Mip->BulkData.SetBulkDataFlags(BULKDATA_PayloadInSeparateFile);
+#else
 		Mip->BulkData.SetBulkDataFlags(BULKDATA_PayloadInSeperateFile);
+#endif
 #endif
 		Mip->BulkData.Lock(LOCK_READ_WRITE);
 
@@ -1389,9 +1400,22 @@ UMaterialInterface* FglTFRuntimeParser::LoadMaterial(const int32 Index, const Fg
 		MaterialName = "";
 	}
 
+	if (MaterialName.IsEmpty() && MaterialsConfig.bForceEmptyMaterialNameToMaterialIndex)
+	{
+		MaterialName = FString::FromInt(Index);
+	}
+
 	if (!MaterialsConfig.bMaterialsOverrideMapInjectParams && MaterialsConfig.MaterialsOverrideByNameMap.Contains(MaterialName))
 	{
 		return MaterialsConfig.MaterialsOverrideByNameMap[MaterialName];
+	}
+
+	if (MaterialsConfig.MaterialRemapper.Remapper.IsBound())
+	{
+		return MaterialsConfig.MaterialRemapper.Remapper.Execute(
+			Index,
+			MaterialName,
+			MaterialsConfig.MaterialRemapper.Context);
 	}
 
 	UMaterialInterface* Material = LoadMaterial_Internal(Index, MaterialName, JsonMaterialObject.ToSharedRef(), MaterialsConfig, bUseVertexColors, ForceBaseMaterial);

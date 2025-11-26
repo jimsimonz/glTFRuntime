@@ -1,4 +1,4 @@
-// Copyright 2020-2023, Roberto De Ioris.
+// Copyright 2020-2025, Roberto De Ioris.
 
 #pragma once
 
@@ -20,6 +20,7 @@
 #include "Engine/TextureCube.h"
 #include "Engine/TextureMipDataProviderFactory.h"
 #include "Engine/VolumeTexture.h"
+#include "UObject/GCObject.h"
 #include "Camera/CameraComponent.h"
 #include "Components/AudioComponent.h"
 #include "Components/LightComponent.h"
@@ -146,6 +147,53 @@ struct FglTFRuntimeBasisMatrix
 	}
 };
 
+DECLARE_DYNAMIC_DELEGATE_RetVal_TwoParams(FString, FglTFRuntimePasswordPrompt, const FString&, FileName, UObject*, Context);
+DECLARE_DELEGATE_RetVal_TwoParams(FString, FglTFRuntimeNativePasswordPrompt, const FString&, UObject*);
+
+USTRUCT(BlueprintType)
+struct FglTFRuntimePasswordPromptHook
+{
+	GENERATED_BODY()
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "glTFRuntime")
+	FglTFRuntimePasswordPrompt Prompt;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "glTFRuntime")
+	bool bReusePassword = true;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "glTFRuntime")
+	UObject* Context = nullptr;
+
+	FglTFRuntimeNativePasswordPrompt NativePrompt;
+
+	bool IsBound() const
+	{
+		return Prompt.IsBound() || NativePrompt.IsBound();
+	}
+};
+
+DECLARE_DYNAMIC_DELEGATE_RetVal_FourParams(TArray<uint8>, FglTFRuntimeAESDecrypter, const uint8, AESEncryptionStrength, const TArray<uint8>&, EncryptedBytes, const TArray<uint8>&, Password, UObject*, Context);
+DECLARE_DELEGATE_RetVal_FourParams(TArray<uint8>, FglTFRuntimeNativeAESDecrypter, const uint8, const TArray<uint8>&, const TArray<uint8>&, UObject*);
+
+USTRUCT(BlueprintType)
+struct FglTFRuntimeAESDecrypterHook
+{
+	GENERATED_BODY()
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "glTFRuntime")
+	FglTFRuntimeAESDecrypter AESDecrypter;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "glTFRuntime")
+	UObject* Context = nullptr;
+
+	FglTFRuntimeNativeAESDecrypter NativeAESDecrypter;
+
+	bool IsBound() const
+	{
+		return AESDecrypter.IsBound() || NativeAESDecrypter.IsBound();
+	}
+};
+
 USTRUCT(BlueprintType)
 struct FglTFRuntimeConfig
 {
@@ -206,6 +254,12 @@ struct FglTFRuntimeConfig
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "glTFRuntime")
 	bool bNoArchive;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "glTFRuntime")
+	FglTFRuntimePasswordPromptHook PasswordPromptHook;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "glTFRuntime")
+	FglTFRuntimeAESDecrypterHook AESDecrypterHook;
 
 	FglTFRuntimeConfig()
 	{
@@ -532,6 +586,34 @@ enum class EglTFRuntimeLinesTriangulationMode : uint8
 	Custom
 };
 
+DECLARE_DYNAMIC_DELEGATE_RetVal_FourParams(FString, FglTFRuntimeMaterialSlotRemapper, const int32, LODIndex, const int32, MaterialIndex, const FString&, MaterialName, UObject*, Context);
+
+USTRUCT(BlueprintType)
+struct FglTFRuntimeMaterialSlotRemapperHook
+{
+	GENERATED_BODY()
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "glTFRuntime")
+	FglTFRuntimeMaterialSlotRemapper Remapper;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "glTFRuntime")
+	UObject* Context = nullptr;
+};
+
+DECLARE_DYNAMIC_DELEGATE_RetVal_ThreeParams(UMaterialInterface*, FglTFRuntimeMaterialRemapper, const int32, MaterialIndex, const FString&, MaterialName, UObject*, Context);
+
+USTRUCT(BlueprintType)
+struct FglTFRuntimeMaterialRemapperHook
+{
+	GENERATED_BODY()
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "glTFRuntime")
+	FglTFRuntimeMaterialRemapper Remapper;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "glTFRuntime")
+	UObject* Context = nullptr;
+};
+
 USTRUCT(BlueprintType)
 struct FglTFRuntimeMaterialsConfig
 {
@@ -648,6 +730,18 @@ struct FglTFRuntimeMaterialsConfig
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "glTFRuntime")
 	TMap<EglTFRuntimeMaterialType, UMaterialInterface*> SheenOverrideMap;
 
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "glTFRuntime")
+	FglTFRuntimeMaterialSlotRemapperHook MaterialSlotRemapper;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "glTFRuntime")
+	bool bForceEmptyMaterialNameToMaterialIndex;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "glTFRuntime")
+	FglTFRuntimeMaterialRemapperHook MaterialRemapper;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "glTFRuntime")
+	TArray<FString> CollectWeightMaps;
+
 	FglTFRuntimeMaterialsConfig()
 	{
 		CacheMode = EglTFRuntimeCacheMode::ReadWrite;
@@ -669,6 +763,7 @@ struct FglTFRuntimeMaterialsConfig
 		LinesBaseMaterial = nullptr;
 		LinesScaleFactor = 1;
 		bAddEpicInterchangeParams = false;
+		bForceEmptyMaterialNameToMaterialIndex = false;
 	}
 };
 
@@ -765,6 +860,9 @@ struct FglTFRuntimeStaticMeshConfig
 		return nullptr;
 	}
 
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "glTFRuntime")
+	bool bUseHighPrecisionTangentBasis;
+
 	FglTFRuntimeStaticMeshConfig()
 	{
 		CacheMode = EglTFRuntimeCacheMode::ReadWrite;
@@ -783,6 +881,7 @@ struct FglTFRuntimeStaticMeshConfig
 		bBuildNavCollision = false;
 		LODScreenSizeMultiplier = 2;
 		bBuildLumenCards = false;
+		bUseHighPrecisionTangentBasis = false;
 	}
 };
 
@@ -1118,6 +1217,20 @@ struct FglTFRuntimeBoneBoundsFilterHook
 	UObject* Context = nullptr;
 };
 
+DECLARE_DYNAMIC_DELEGATE_RetVal_ThreeParams(FString, FglTFRuntimeMorphTargetRemapper, const int32, MorphTargetIndex, const FString&, MorphTargetName, UObject*, Context);
+
+USTRUCT(BlueprintType)
+struct FglTFRuntimeMorphTargetRemapperHook
+{
+	GENERATED_BODY()
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "glTFRuntime")
+	FglTFRuntimeMorphTargetRemapper Remapper;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "glTFRuntime")
+	UObject* Context = nullptr;
+};
+
 USTRUCT(BlueprintType)
 struct FglTFRuntimeSkeletalMeshConfig
 {
@@ -1222,6 +1335,12 @@ struct FglTFRuntimeSkeletalMeshConfig
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "glTFRuntime")
 	bool bAllowCPUAccess;
 
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "glTFRuntime")
+	bool bUseHighPrecisionTangentBasis;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "glTFRuntime")
+	FglTFRuntimeMorphTargetRemapperHook MorphTargetRemapper;
+
 	FglTFRuntimeSkeletalMeshConfig()
 	{
 		CacheMode = EglTFRuntimeCacheMode::ReadWrite;
@@ -1248,6 +1367,7 @@ struct FglTFRuntimeSkeletalMeshConfig
 		bAutoGeneratePhysicsAssetBodies = false;
 		bAutoGeneratePhysicsAssetConstraints = false;
 		bAllowCPUAccess = false;
+		bUseHighPrecisionTangentBasis = false;
 	}
 };
 
@@ -1271,6 +1391,8 @@ struct FglTFRuntimePathItem
 DECLARE_DYNAMIC_DELEGATE_RetVal_FourParams(FString, FglTFRuntimeAnimationCurveRemapper, const int32, NodeIndex, const FString&, CurveName, const FString&, Path, UObject*, Context);
 DECLARE_DYNAMIC_DELEGATE_RetVal_FourParams(FVector, FglTFRuntimeAnimationFrameTranslationRemapper, const FString&, CurveName, const int32, FrameNumber, FVector, Translation, UObject*, Context);
 DECLARE_DYNAMIC_DELEGATE_RetVal_FourParams(FRotator, FglTFRuntimeAnimationFrameRotationRemapper, const FString&, CurveName, const int32, FrameNumber, FRotator, Rotation, UObject*, Context);
+DECLARE_DYNAMIC_DELEGATE_RetVal_FourParams(float, FglTFRuntimeAnimationFrameMorphTargetWeightRemapper, const FString&, CurveName, const int32, FrameNumber, float, Weight, UObject*, Context);
+
 
 USTRUCT(BlueprintType)
 struct FglTFRuntimeSkeletalAnimationCurveRemapperHook
@@ -1303,6 +1425,18 @@ struct FglTFRuntimeSkeletalAnimationFrameRotationRemapperHook
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "glTFRuntime")
 	FglTFRuntimeAnimationFrameRotationRemapper Remapper;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "glTFRuntime")
+	UObject* Context = nullptr;
+};
+
+USTRUCT(BlueprintType)
+struct FglTFRuntimeSkeletalAnimationFrameMorphTargetWeightRemapperHook
+{
+	GENERATED_BODY()
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "glTFRuntime")
+	FglTFRuntimeAnimationFrameMorphTargetWeightRemapper Remapper;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "glTFRuntime")
 	UObject* Context = nullptr;
@@ -1378,6 +1512,9 @@ struct FglTFRuntimeSkeletalAnimationConfig
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "glTFRuntime")
 	UPoseAsset* PoseForRetargeting;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "glTFRuntime")
+	FglTFRuntimeSkeletalAnimationFrameMorphTargetWeightRemapperHook FrameMorphTargetWeightRemapper;
 
 	FglTFRuntimeSkeletalAnimationConfig()
 	{
@@ -1472,6 +1609,8 @@ struct FglTFRuntimePrimitive
 
 	bool bDisableShadows;
 	bool bHasIndices;
+
+	TMap<FString, TArray<float>> WeightMaps;
 
 	FglTFRuntimePrimitive()
 	{
@@ -2065,7 +2204,7 @@ struct FglTFRuntimeMaterial
 	}
 };
 
-class FglTFRuntimeArchive
+class GLTFRUNTIME_API FglTFRuntimeArchive
 {
 public:
 	virtual ~FglTFRuntimeArchive() {}
@@ -2083,9 +2222,10 @@ public:
 
 protected:
 	TMap<FString, uint32> OffsetsMap;
+	TMap<FString, TPair<uint32, uint32>> GlobalSizeMap;
 };
 
-class FglTFRuntimeArchiveZip : public FglTFRuntimeArchive
+class GLTFRUNTIME_API FglTFRuntimeArchiveZip : public FglTFRuntimeArchive
 {
 public:
 	bool FromData(const uint8* DataPtr, const int64 DataNum);
@@ -2093,6 +2233,9 @@ public:
 	bool GetFileContent(const FString& Filename, TArray64<uint8>& OutData) override;
 
 	void SetPassword(const FString& EncryptionKey);
+
+	FglTFRuntimePasswordPromptHook PromptHook;
+	FglTFRuntimeAESDecrypterHook AESDecrypterHook;
 
 protected:
 	FArrayReader Data;
@@ -2158,7 +2301,7 @@ struct FglTFRuntimeAudioConfig
 	}
 };
 
-class FglTFRuntimeDDS
+class GLTFRUNTIME_API FglTFRuntimeDDS
 {
 public:
 	FglTFRuntimeDDS() = delete;
@@ -2220,6 +2363,13 @@ DECLARE_MULTICAST_DELEGATE_OneParam(FglTFRuntimeOnPreCreatedSkeletalMesh, FglTFR
 DECLARE_MULTICAST_DELEGATE_ThreeParams(FglTFRuntimeOnFinalizedStaticMesh, TSharedRef<FglTFRuntimeParser>, UStaticMesh*, const FglTFRuntimeStaticMeshConfig&);
 #endif
 
+namespace glTFRuntime
+{
+	GLTFRUNTIME_API bool FillSkeletalMeshRenderData(FSkeletalMeshRenderData* RenderData, const TArray<FglTFRuntimeMeshLOD*>& LODs, const FReferenceSkeleton& RefSkeleton, const int32 SkinIndex, const TMap<int32, FName>& MainBoneMap, FBox& BoundingBox, const FglTFRuntimeSkeletalMeshConfig& SkeletalMeshConfig, TFunction<void(const FString& ErrorContext, const FString& ErrorMessage)> ErrorCallback);
+	GLTFRUNTIME_API FVector ComputeTangentY(const FVector Normal, const FVector TangetX);
+	GLTFRUNTIME_API FVector ComputeTangentYWithW(const FVector Normal, const FVector TangetX, const float W);
+}
+
 /**
  *
  */
@@ -2271,6 +2421,7 @@ public:
 
 	bool LoadScenes(TArray<FglTFRuntimeScene>& Scenes);
 	bool LoadScene(int32 SceneIndex, FglTFRuntimeScene& Scene);
+	int32 GetDefaultSceneIndex() const;
 
 	bool RemapRuntimeLODBoneNames(FglTFRuntimeMeshLOD& RuntimeLOD, const FglTFRuntimeSkeletonConfig& SkeletonConfig);
 
@@ -2279,14 +2430,29 @@ public:
 	void LoadSkeletalMeshFromRuntimeLODsAsync(const TArray<FglTFRuntimeMeshLOD>& RuntimeLODs, const int32 SkinIndex, const FglTFRuntimeSkeletalMeshAsync& AsyncCallback, const FglTFRuntimeSkeletalMeshConfig& SkeletalMeshConfig);
 
 	UAnimSequence* LoadSkeletalAnimation(USkeletalMesh* SkeletalMesh, const int32 AnimationIndex, const FglTFRuntimeSkeletalAnimationConfig& SkeletalAnimationConfig);
-	UAnimSequence* LoadSkeletalAnimationByName(USkeletalMesh* SkeletalMesh, const FString AnimationName, const FglTFRuntimeSkeletalAnimationConfig& SkeletalAnimationConfig);
+	UAnimSequence* LoadSkeletalAnimationByName(USkeletalMesh* SkeletalMesh, const FString& AnimationName, const FglTFRuntimeSkeletalAnimationConfig& SkeletalAnimationConfig, const bool bCaseSensitive = false);
+	UAnimSequence* LoadSkeletalAnimationOnSkeleton(USkeleton* Skeleton, const int32 AnimationIndex, const FglTFRuntimeSkeletalAnimationConfig& SkeletalAnimationConfig);
+	UAnimSequence* LoadSkeletalAnimationByNameOnSkeleton(USkeleton* Skeleton, const FString& AnimationName, const FglTFRuntimeSkeletalAnimationConfig& SkeletalAnimationConfig, const bool bCaseSensitive = false);
 	UAnimSequence* LoadNodeSkeletalAnimation(USkeletalMesh* SkeletalMesh, const int32 NodeIndex, const FglTFRuntimeSkeletalAnimationConfig& SkeletalAnimationConfig);
 	TMap<FString, UAnimSequence*> LoadNodeSkeletalAnimationsMap(USkeletalMesh* SkeletalMesh, const int32 NodeIndex, const FglTFRuntimeSkeletalAnimationConfig& SkeletalAnimationConfig);
 	USkeleton* LoadSkeleton(const int32 SkinIndex, const FglTFRuntimeSkeletonConfig& SkeletonConfig);
 	USkeleton* LoadSkeletonFromNode(const FglTFRuntimeNode& Node, const FglTFRuntimeSkeletonConfig& SkeletonConfig);
 
+	UAnimSequence* LoadAndMergeSkeletalAnimations(USkeletalMesh* SkeletalMesh, const TArray<int32> AnimationIndices, const bool bRandomize, const FglTFRuntimeSkeletalAnimationConfig& SkeletalAnimationConfig);
+
+	UAnimSequence* LoadAndMergeSkeletalAnimationsByName(USkeletalMesh* SkeletalMesh, const TArray<FString> AnimationNames, const bool bIgnoreNonExistent, const bool bRandomize, const FglTFRuntimeSkeletalAnimationConfig& SkeletalAnimationConfig);
+
+	int32 GetAnimationIndexByName(const FString& AnimationName, const bool bCaseSensitive) const;
+
 	UAnimSequence* LoadSkeletalAnimationFromTracksAndMorphTargets(USkeletalMesh* SkeletalMesh, TMap<FString, FRawAnimSequenceTrack>& Tracks, TMap<FName, TArray<TPair<float, float>>>& MorphTargetCurves, const float Duration, const FglTFRuntimeSkeletalAnimationConfig& SkeletalAnimationConfig);
 	UAnimSequence* LoadSkeletalAnimationFromTracksAndMorphTargets(USkeleton* Skeleton, TMap<FString, FRawAnimSequenceTrack>& Tracks, TMap<FName, TArray<TPair<float, float>>>& MorphTargetCurves, const float Duration, const FglTFRuntimeSkeletalAnimationConfig& SkeletalAnimationConfig);
+
+	bool LoadAnimationAsTracksAndMorphTargets(const int32 AnimationIndex, TMap<FString, FRawAnimSequenceTrack>& Tracks, TMap<FName, TArray<TPair<float, float>>>& MorphTargetCurves, float& Duration, const FglTFRuntimeSkeletalAnimationConfig& SkeletalAnimationConfig);
+	bool LoadAnimationByNameAsTracksAndMorphTargets(const FString& AnimationName, TMap<FString, FRawAnimSequenceTrack>& Tracks, TMap<FName, TArray<TPair<float, float>>>& MorphTargetCurves, float& Duration, const FglTFRuntimeSkeletalAnimationConfig& SkeletalAnimationConfig, const bool bCaseSensitive);
+
+	bool SanitizeBoneTrack(const FReferenceSkeleton& RefSkeleton, const FString& BoneName, const int32 NumFrames, FRawAnimSequenceTrack& Track, const FglTFRuntimeSkeletalAnimationConfig& SkeletalAnimationConfig);
+
+	FglTFRuntimePoseTracksMap FixupAnimationTracks(const FglTFRuntimePoseTracksMap& Tracks, const TMap<FString, FTransform>& RestTransforms, const FglTFRuntimeSkeletalAnimationConfig& SkeletalAnimationConfig);
 
 	void LoadSkeletalMeshAsync(const int32 MeshIndex, const int32 SkinIndex, const FglTFRuntimeSkeletalMeshAsync& AsyncCallback, const FglTFRuntimeSkeletalMeshConfig& SkeletalMeshConfig);
 	void LoadStaticMeshAsync(const int32 MeshIndex, const FglTFRuntimeStaticMeshAsync& AsyncCallback, const FglTFRuntimeStaticMeshConfig& StaticMeshConfig);
@@ -2369,9 +2535,13 @@ public:
 	double GetJSONNumberFromPath(const TArray<FglTFRuntimePathItem>& Path, bool& bFound) const;
 	bool GetJSONBooleanFromPath(const TArray<FglTFRuntimePathItem>& Path, bool& bFound) const;
 
+	FString GetJSONSerializedStringFromPath(const TArray<FglTFRuntimePathItem>& Path, bool& bFound) const;
+
 	int32 GetJSONArraySizeFromPath(const TArray<FglTFRuntimePathItem>& Path, bool& bFound) const;
 	FVector4 GetJSONVectorFromPath(const TArray<FglTFRuntimePathItem>& Path, bool& bFound) const;
 	TArray<FString> GetJSONObjectKeysFromPath(const TArray<FglTFRuntimePathItem>& Path, bool& bFound) const;
+	TArray<FString> GetJSONStringArrayFromPath(const TArray<FglTFRuntimePathItem>& Path, bool& bFound) const;
+	TMap<FString, FString> GetJSONStringMapFromPath(const TArray<FglTFRuntimePathItem>& Path, bool& bFound) const;
 
 	bool GetStringMapFromExtras(const FString& Key, TMap<FString, FString>& StringMap) const;
 	bool GetStringArrayFromExtras(const FString& Key, TArray<FString>& StringArray) const;
@@ -2388,6 +2558,7 @@ public:
 
 	FString GetVersion() const;
 	FString GetGenerator() const;
+	TSharedPtr<FJsonObject> GetAssetMeta() const;
 
 	bool LoadImageBytes(const int32 ImageIndex, TSharedPtr<FJsonObject>& JsonImageObject, TArray64<uint8>& Bytes);
 	bool LoadImage(const int32 ImageIndex, TArray64<uint8>& UncompressedBytes, int32& Width, int32& Height, EPixelFormat& PixelFormat, const FglTFRuntimeImagesConfig& ImagesConfig);
@@ -2513,6 +2684,7 @@ public:
 	void UpdateSceneBasis(const FMatrix& InSceneBasis);
 	void UpdateSceneScale(const float& InSceneScale);
 	float GetSceneScale() const;
+
 protected:
 	void LoadAndFillBaseMaterials();
 	TSharedRef<FJsonObject> Root;
@@ -2566,7 +2738,7 @@ protected:
 	bool FillLODSkeleton(FReferenceSkeleton& RefSkeleton, TMap<int32, FName>& BoneMap, const TArray<FglTFRuntimeBone>& Skeleton);
 	bool TraverseJoints(FReferenceSkeletonModifier& Modifier, const int32 RootIndex, int32 Parent, const FglTFRuntimeNode& Node, const TArray<int32>& Joints, TMap<int32, FName>& BoneMap, const TMap<int32, FMatrix>& InverseBindMatricesMap, const FglTFRuntimeSkeletonConfig& SkeletonConfig);
 
-	bool GetMorphTargetNames(const int32 MeshIndex, TArray<FName>& MorphTargetNames);
+	bool GetMorphTargetNames(const int32 MeshIndex, TArray<FString>& MorphTargetNames);
 
 	void FixNodeParent(FglTFRuntimeNode& Node);
 
@@ -2938,9 +3110,6 @@ protected:
 		return Values[Index];
 	}
 
-	FVector ComputeTangentY(const FVector Normal, const FVector TangetX);
-	FVector ComputeTangentYWithW(const FVector Normal, const FVector TangetX, const float W);
-
 	TArray64<uint8> ZeroBuffer;
 	TMap<int32, TArray64<uint8>> SparseAccessorsCache;
 	TMap<int32, int64> SparseAccessorsStridesCache;
@@ -2979,6 +3148,8 @@ public:
 
 	const FString& GetBaseDirectory() const { return BaseDirectory; }
 	const FString& GetBaseFilename() const { return BaseFilename; }
+
+	void SetBaseDirectory(const FString& NewBaseDirectory) { BaseDirectory = NewBaseDirectory; }
 
 	bool LoadPathToBlob(const FString& Path, TArray64<uint8>& Blob);
 

@@ -490,6 +490,16 @@ TSharedPtr<FglTFRuntimeParser> FglTFRuntimeParser::FromData(const uint8* DataPtr
 			ZipFile->SetPassword(LoaderConfig.EncryptionKey);
 		}
 
+		if (LoaderConfig.PasswordPromptHook.IsBound())
+		{
+			ZipFile->PromptHook = LoaderConfig.PasswordPromptHook;
+		}
+
+		if (LoaderConfig.AESDecrypterHook.IsBound())
+		{
+			ZipFile->AESDecrypterHook = LoaderConfig.AESDecrypterHook;
+		}
+
 		if (!ZipFile->FromData(DataPtr, DataNum))
 		{
 			UE_LOG(LogGLTFRuntime, Error, TEXT("Unable to parse Zip archive."));
@@ -1030,6 +1040,17 @@ bool FglTFRuntimeParser::LoadScenes(TArray<FglTFRuntimeScene>& Scenes)
 	return true;
 }
 
+int32 FglTFRuntimeParser::GetDefaultSceneIndex() const
+{
+	int32 SceneIndex = INDEX_NONE;
+	if (!Root->TryGetNumberField(TEXT("scene"), SceneIndex))
+	{
+		return INDEX_NONE;
+	}
+
+	return SceneIndex;
+}
+
 bool FglTFRuntimeParser::CheckJsonIndex(TSharedRef<FJsonObject> JsonObject, const FString& FieldName, const int32 Index, TArray<TSharedRef<FJsonValue>>& JsonItems) const
 {
 	if (Index < 0)
@@ -1479,7 +1500,10 @@ void FglTFRuntimeParser::AddError(const FString& ErrorContext, const FString& Er
 {
 	FString FullMessage = ErrorContext + ": " + ErrorMessage;
 	Errors.Add(FullMessage);
-	UE_LOG(LogGLTFRuntime, Error, TEXT("%s"), *FullMessage);
+	if (!GIsAutomationTesting)
+	{
+		UE_LOG(LogGLTFRuntime, Error, TEXT("%s"), *FullMessage);
+	}
 	if (OnError.IsBound())
 	{
 		OnError.Broadcast(ErrorContext, ErrorMessage);
@@ -1588,13 +1612,28 @@ bool FglTFRuntimeParser::LoadNode_Internal(int32 Index, TSharedRef<FJsonObject> 
 	}
 
 	Matrix.ScaleTranslation(FVector(SceneScale, SceneScale, SceneScale));
-	Node.Transform = FTransform(SceneBasis.Inverse() * Matrix * SceneBasis);
+
+	const FMatrix FinalMatrix = SceneBasis.Inverse() * Matrix * SceneBasis;
+	Node.Transform = FTransform(FinalMatrix);
 	// this is a hack for allowing very small scaling factors (common in quantized meshes)
 	// it is required as the FTransform ctor generates 0 scaling for small numbers
 	if (bMatrixScaleNeedsToBeReapplied)
 	{
 		Node.Transform.SetScale3D(MatrixScaleToReapply);
 	}
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION < 6
+	// workaround for double/float loss of precision in UE < 5.6
+	else
+	{
+		const FVector CurrentScale = Node.Transform.GetScale3D();
+		if (CurrentScale.X == 0.0 || CurrentScale.Y == 0.0 || CurrentScale.Z == 0.0)
+		{
+			FMatrix FinalMatrixCopy = FinalMatrix;
+			Node.Transform.SetScale3D(FinalMatrixCopy.ExtractScaling(0));
+			Node.Transform.SetRotation(FinalMatrixCopy.ToQuat());
+		}
+	}
+#endif
 
 	const TArray<TSharedPtr<FJsonValue>>* JsonChildren;
 	if (JsonNodeObject->TryGetArrayField(TEXT("children"), JsonChildren))
@@ -1750,7 +1789,8 @@ bool FglTFRuntimeParser::LoadAnimation_Internal(TSharedRef<FJsonObject> JsonAnim
 			int64 NodeIndex;
 			if (!(*JsonTargetObject)->TryGetNumberField(TEXT("node"), NodeIndex))
 			{
-				return false;
+				// "node" is not required, so do not block parsing
+				continue;
 			}
 
 			if (!LoadNode(NodeIndex, Node))
@@ -1982,7 +2022,7 @@ TArray<UglTFRuntimeAnimationCurve*> FglTFRuntimeParser::LoadAllNodeAnimationCurv
 		bAnimationFound = false;
 		AnimationCurve = NewObject<UglTFRuntimeAnimationCurve>(GetTransientPackage(), NAME_None, RF_Public);
 		AnimationCurve->SetDefaultValues(OriginalTransform.GetLocation(), OriginalTransform.GetRotation(), OriginalTransform.GetRotation().Rotator(), OriginalTransform.GetScale3D());
-		if (!LoadAnimation_Internal(JsonAnimationObject.ToSharedRef(), Duration, Name, Callback, [&](const FglTFRuntimeNode& Node) -> bool { return Node.Index == NodeIndex; }, {}))
+		if (!LoadAnimation_Internal(JsonAnimationObject.ToSharedRef(), Duration, Name, Callback, [&](const FglTFRuntimeNode& Node) -> bool { UE_LOG(LogTemp, Error, TEXT("Node: %d %d"), Node.Index, NodeIndex); return Node.Index == NodeIndex; }, {}))
 		{
 			continue;
 		}
@@ -2591,7 +2631,7 @@ bool FglTFRuntimeParser::RemapRuntimeLODBoneNames(FglTFRuntimeMeshLOD& RuntimeLO
 		{
 			Bone.BoneName = SkeletonConfig.BoneRemapper.Remapper.Execute(BoneIndex, Bone.BoneName, SkeletonConfig.BoneRemapper.Context);
 		}
-		
+
 		if (SkeletonConfig.BonesNameMap.Contains(Bone.BoneName))
 		{
 			FString BoneNameMapValue = SkeletonConfig.BonesNameMap[Bone.BoneName];
@@ -3078,7 +3118,7 @@ bool FglTFRuntimeParser::LoadPrimitive(TSharedRef<FJsonObject> JsonPrimitiveObje
 	}
 
 	if (!BuildFromAccessorField(JsonAttributesObject->ToSharedRef(), "POSITION", Primitive.Positions,
-		{ 3 }, SupportedPositionComponentTypes, [&](FVector Value) -> FVector {return SceneBasis.TransformPosition(Value) * SceneScale; }, Primitive.AdditionalBufferView, false, nullptr))
+		{ 3 }, SupportedPositionComponentTypes, [this](FVector Value) -> FVector {return SceneBasis.TransformPosition(Value) * SceneScale; }, Primitive.AdditionalBufferView, false, nullptr))
 	{
 		AddError("LoadPrimitive()", "Unable to load POSITION attribute");
 		return false;
@@ -3087,7 +3127,7 @@ bool FglTFRuntimeParser::LoadPrimitive(TSharedRef<FJsonObject> JsonPrimitiveObje
 	if ((*JsonAttributesObject)->HasField(TEXT("NORMAL")))
 	{
 		if (!BuildFromAccessorField(JsonAttributesObject->ToSharedRef(), "NORMAL", Primitive.Normals,
-			{ 3 }, SupportedNormalComponentTypes, [&](FVector Value) -> FVector { return SceneBasis.TransformVector(Value); }, Primitive.AdditionalBufferView, true, nullptr))
+			{ 3 }, SupportedNormalComponentTypes, [this](FVector Value) -> FVector { return SceneBasis.TransformVector(Value); }, Primitive.AdditionalBufferView, true, nullptr))
 		{
 			AddError("LoadPrimitive()", "Unable to load NORMAL attribute");
 			return false;
@@ -3097,7 +3137,7 @@ bool FglTFRuntimeParser::LoadPrimitive(TSharedRef<FJsonObject> JsonPrimitiveObje
 	if ((*JsonAttributesObject)->HasField(TEXT("TANGENT")))
 	{
 		if (!BuildFromAccessorField(JsonAttributesObject->ToSharedRef(), "TANGENT", Primitive.Tangents,
-			{ 4 }, SupportedTangentComponentTypes, [&](FVector4 Value) -> FVector4 { return SceneBasis.TransformFVector4(Value); }, Primitive.AdditionalBufferView, true, nullptr))
+			{ 4 }, SupportedTangentComponentTypes, [this](FVector4 Value) -> FVector4 { return SceneBasis.TransformFVector4(Value); }, Primitive.AdditionalBufferView, true, nullptr))
 		{
 			AddError("LoadPrimitive()", "Unable to load TANGENT attribute");
 			return false;
@@ -3109,7 +3149,7 @@ bool FglTFRuntimeParser::LoadPrimitive(TSharedRef<FJsonObject> JsonPrimitiveObje
 		TArray<FVector2D> UV;
 		int64 TexCoordComponentType = 0;
 		if (!BuildFromAccessorField(JsonAttributesObject->ToSharedRef(), "TEXCOORD_0", UV,
-			{ 2 }, SupportedTexCoordComponentTypes, [&](FVector2D Value) -> FVector2D {return FVector2D(Value.X, Value.Y); }, Primitive.AdditionalBufferView, !bHasMeshQuantization, &TexCoordComponentType))
+			{ 2 }, SupportedTexCoordComponentTypes, [](FVector2D Value) -> FVector2D {return FVector2D(Value.X, Value.Y); }, Primitive.AdditionalBufferView, !bHasMeshQuantization, &TexCoordComponentType))
 		{
 			AddError("LoadPrimitive()", "Error loading TEXCOORD_0");
 			return false;
@@ -3128,7 +3168,7 @@ bool FglTFRuntimeParser::LoadPrimitive(TSharedRef<FJsonObject> JsonPrimitiveObje
 		TArray<FVector2D> UV;
 		int64 TexCoordComponentType = 0;
 		if (!BuildFromAccessorField(JsonAttributesObject->ToSharedRef(), "TEXCOORD_1", UV,
-			{ 2 }, SupportedTexCoordComponentTypes, [&](FVector2D Value) -> FVector2D {return FVector2D(Value.X, Value.Y); }, Primitive.AdditionalBufferView, !bHasMeshQuantization, &TexCoordComponentType))
+			{ 2 }, SupportedTexCoordComponentTypes, [](FVector2D Value) -> FVector2D {return FVector2D(Value.X, Value.Y); }, Primitive.AdditionalBufferView, !bHasMeshQuantization, &TexCoordComponentType))
 		{
 			AddError("LoadPrimitive()", "Error loading TEXCOORD_1");
 			return false;
@@ -3246,6 +3286,28 @@ bool FglTFRuntimeParser::LoadPrimitive(TSharedRef<FJsonObject> JsonPrimitiveObje
 			AddError("LoadPrimitive()", "Error loading COLOR_0");
 			return false;
 		}
+	}
+
+	for (const FString& CollectWeightMap : MaterialsConfig.CollectWeightMaps)
+	{
+		// already processed?
+		if (Primitive.WeightMaps.Contains(CollectWeightMap))
+		{
+			continue;
+		}
+		TArray<float> Weights;
+		int64 WeightsComponentType = 0;
+		if ((*JsonAttributesObject)->HasField(CollectWeightMap))
+		{
+			if (!BuildFromAccessorField(JsonAttributesObject->ToSharedRef(), CollectWeightMap, Weights,
+				{ 5126 }, [](float Value) -> float { return Value; }, Primitive.AdditionalBufferView, false, &WeightsComponentType))
+			{
+				AddError("LoadPrimitive()", FString::Printf(TEXT("Error loading %s"), *CollectWeightMap));
+				return false;
+			}
+		}
+
+		Primitive.WeightMaps.Add(CollectWeightMap, Weights);
 	}
 
 	const TArray<TSharedPtr<FJsonValue>>* JsonTargetsArray;
@@ -5143,7 +5205,7 @@ bool FglTFRuntimeParser::MeshHasMorphTargets(const int32 MeshIndex) const
 	return false;
 }
 
-bool FglTFRuntimeParser::GetMorphTargetNames(const int32 MeshIndex, TArray<FName>& MorphTargetNames)
+bool FglTFRuntimeParser::GetMorphTargetNames(const int32 MeshIndex, TArray<FString>& MorphTargetNames)
 {
 	TSharedPtr<FJsonObject> JsonMeshObject = GetJsonObjectFromRootIndex("meshes", MeshIndex);
 	if (!JsonMeshObject)
@@ -5188,7 +5250,7 @@ bool FglTFRuntimeParser::GetMorphTargetNames(const int32 MeshIndex, TArray<FName
 
 		for (int32 MorphIndex = 0; MorphIndex < JsonTargetsArray->Num(); MorphIndex++)
 		{
-			FName MorphTargetName = FName(FString::Printf(TEXT("MorphTarget_%d"), MorphTargetIndex++));
+			const FString MorphTargetName = FString::Printf(TEXT("MorphTarget_%d"), MorphTargetIndex++);
 			MorphTargetNames.Add(MorphTargetName);
 		}
 
@@ -5206,7 +5268,7 @@ bool FglTFRuntimeParser::GetMorphTargetNames(const int32 MeshIndex, TArray<FName
 			{
 				if (MorphTargetNames.IsValidIndex(TargetNameIndex))
 				{
-					MorphTargetNames[TargetNameIndex] = FName((*JsonTargetNamesArray)[TargetNameIndex]->AsString());
+					MorphTargetNames[TargetNameIndex] = (*JsonTargetNamesArray)[TargetNameIndex]->AsString();
 				}
 			}
 		}
@@ -5284,10 +5346,17 @@ bool FglTFRuntimeArchiveZip::FromData(const uint8* DataPtr, const int64 DataNum)
 			return false;
 		}
 
+		uint32 GlobalCompressedSize = 0;
+		uint32 GlobalUncompressedSize = 0;
 		uint16 FilenameLen = 0;
 		uint16 ExtraFieldLen = 0;
 		uint16 EntryCommentLen = 0;
 		uint32 EntryOffset = 0;
+
+		// seek to CompressedSize
+		Data.Seek(CentralDirectoryOffset + 20);
+		Data << GlobalCompressedSize;
+		Data << GlobalUncompressedSize;
 
 		// seek to FilenameLen
 		Data.Seek(CentralDirectoryOffset + 28);
@@ -5310,6 +5379,7 @@ bool FglTFRuntimeArchiveZip::FromData(const uint8* DataPtr, const int64 DataNum)
 		FString Filename = FString(UTF8_TO_TCHAR(FilenameBytes.GetData()));
 
 		OffsetsMap.Add(Filename, EntryOffset);
+		GlobalSizeMap.Add(Filename, TPair<uint32, uint32>(GlobalCompressedSize, GlobalUncompressedSize));
 
 		CentralDirectoryOffset += CentralDirectoryMinSize + FilenameLen + ExtraFieldLen + EntryCommentLen;
 	}
@@ -5357,46 +5427,194 @@ bool FglTFRuntimeArchiveZip::GetFileContent(const FString& Filename, TArray64<ui
 
 	const uint8* CompressedData = Data.GetData() + *Offset + LocalEntryMinSize + FilenameLen + ExtraFieldLen;
 
-	// encrypted ?
-	TArray64<uint8> DecryptedData;
-	if (Flags & 1 && Password.Num() > 0)
+	// for streamed zips
+
+	if (CompressedSize == 0 && GlobalSizeMap.Contains(Filename))
 	{
-		if (*Offset + LocalEntryMinSize + FilenameLen + ExtraFieldLen + CompressedSize + 12 > Data.Num())
+		CompressedSize = GlobalSizeMap[Filename].Key;
+	}
+
+	if (UncompressedSize == 0 && GlobalSizeMap.Contains(Filename))
+	{
+		UncompressedSize = GlobalSizeMap[Filename].Value;
+	}
+
+	// encrypted ?
+
+	// first check for password prompt
+	bool bClearPassword = false;
+	if (Flags & 1 && Password.Num() <= 0 && PromptHook.IsBound())
+	{
+		if (IsInGameThread())
 		{
+			if (PromptHook.Prompt.IsBound())
+			{
+				SetPassword(PromptHook.Prompt.Execute(Filename, PromptHook.Context));
+			}
+			else if (PromptHook.NativePrompt.IsBound())
+			{
+				SetPassword(PromptHook.NativePrompt.Execute(Filename, PromptHook.Context));
+			}
+		}
+		else
+		{
+			FGraphEventRef Task = FFunctionGraphTask::CreateAndDispatchWhenReady([&]()
+				{
+					if (PromptHook.Prompt.IsBound())
+					{
+						SetPassword(PromptHook.Prompt.Execute(Filename, PromptHook.Context));
+					}
+					else if (PromptHook.NativePrompt.IsBound())
+					{
+						SetPassword(PromptHook.NativePrompt.Execute(Filename, PromptHook.Context));
+					}
+				}, TStatId(), nullptr, ENamedThreads::GameThread);
+			FTaskGraphInterface::Get().WaitUntilTaskCompletes(Task);
+		}
+
+		bClearPassword = !PromptHook.bReusePassword;
+	}
+
+	TArray64<uint8> DecryptedData;
+	if (Flags & 1)
+	{
+		if (Password.Num() <= 0)
+		{
+			UE_LOG(LogGLTFRuntime, Error, TEXT("No ZIP Decryption key provided"));
 			return false;
 		}
-		DecryptedData.AddUninitialized(CompressedSize + 12);
 
-		uint32 Key0 = 305419896;
-		uint32 Key1 = 591751049;
-		uint32 Key2 = 878082192;
-
-		auto Crc32 = [](const uint8 Byte, const uint32 Crc) -> uint32
-			{
-				return (Crc >> 8) ^ FCrc::CRCTablesSB8[0][(Crc ^ Byte) & 0xFF];
-			};
-
-		auto UpdateKeys = [&Key0, &Key1, &Key2, &Crc32](const uint8 Byte)
-			{
-				Key0 = Crc32(Byte, Key0);
-				Key1 = Key1 + (Key0 & 0xFF);
-				Key1 = Key1 * 134775813 + 1;
-				Key2 = Crc32(Key1 >> 24, Key2);
-			};
-
-		for (const uint8& Byte : Password)
+		if (Compression == 99) // AES?
 		{
-			UpdateKeys(Byte);
-		}
+			if (!AESDecrypterHook.IsBound())
+			{
+				return false;
+			}
 
-		for (int64 EncryptedIndex = 0; EncryptedIndex < CompressedSize + 12; EncryptedIndex++)
+			// TODO, probably I should generalize it to allow custom fields to be managed by the user
+			TArray64<uint8> ExtraField;
+			ExtraField.Append(Data.GetData() + *Offset + LocalEntryMinSize + FilenameLen, ExtraFieldLen);
+			uint32 ExtraFieldsOffset = 0;
+			// 0 is not a valid AES strength so it acts as a marker
+			uint8 AESEncryptionStrength = 0;
+
+			while (ExtraFieldsOffset < ExtraFieldLen)
+			{
+				if ((ExtraFieldsOffset + sizeof(uint16) + sizeof(uint16)) > ExtraFieldLen)
+				{
+					return false;
+				}
+
+				const uint16* ExtraFieldType = reinterpret_cast<const uint16*>(ExtraField.GetData() + ExtraFieldsOffset);
+				const uint16* ExtraFieldSize = reinterpret_cast<const uint16*>(ExtraField.GetData() + ExtraFieldsOffset + sizeof(uint16));
+
+				ExtraFieldsOffset += sizeof(uint16) + sizeof(uint16);
+				if ((ExtraFieldsOffset + *ExtraFieldSize) > ExtraFieldLen)
+				{
+					return false;
+				}
+
+				if (*ExtraFieldType == 0x9901)
+				{
+					// AES
+					if (*ExtraFieldSize < 7)
+					{
+						return false;
+					}
+
+					const uint16* AESZipVersion = reinterpret_cast<const uint16*>(ExtraField.GetData() + ExtraFieldsOffset);
+					const uint16* AESZipVendor = reinterpret_cast<const uint16*>(ExtraField.GetData() + ExtraFieldsOffset + sizeof(uint16));
+					AESEncryptionStrength = *(ExtraField.GetData() + ExtraFieldsOffset + sizeof(uint16) + sizeof(uint16));
+					Compression = *(reinterpret_cast<const uint16*>(ExtraField.GetData() + ExtraFieldsOffset + sizeof(uint16) + sizeof(uint16) + sizeof(uint8)));
+					break;
+				}
+
+				ExtraFieldsOffset += *ExtraFieldSize;
+			}
+
+			if (AESEncryptionStrength == 0)
+			{
+				return false;
+			}
+
+			TArray<uint8> EnryptedData;
+			EnryptedData.Append(CompressedData, CompressedSize);
+
+			if (IsInGameThread())
+			{
+				if (AESDecrypterHook.AESDecrypter.IsBound())
+				{
+					DecryptedData = AESDecrypterHook.AESDecrypter.Execute(AESEncryptionStrength, EnryptedData, Password, AESDecrypterHook.Context);
+				}
+				else if (AESDecrypterHook.NativeAESDecrypter.IsBound())
+				{
+					DecryptedData = AESDecrypterHook.NativeAESDecrypter.Execute(AESEncryptionStrength, EnryptedData, Password, AESDecrypterHook.Context);
+				}
+			}
+			else
+			{
+				FGraphEventRef Task = FFunctionGraphTask::CreateAndDispatchWhenReady([&]()
+					{
+						if (AESDecrypterHook.AESDecrypter.IsBound())
+						{
+							DecryptedData = AESDecrypterHook.AESDecrypter.Execute(AESEncryptionStrength, EnryptedData, Password, AESDecrypterHook.Context);
+						}
+						else if (AESDecrypterHook.NativeAESDecrypter.IsBound())
+						{
+							DecryptedData = AESDecrypterHook.NativeAESDecrypter.Execute(AESEncryptionStrength, EnryptedData, Password, AESDecrypterHook.Context);
+						}
+					}, TStatId(), nullptr, ENamedThreads::GameThread);
+				FTaskGraphInterface::Get().WaitUntilTaskCompletes(Task);
+			}
+
+			CompressedData = DecryptedData.GetData();
+			CompressedSize = DecryptedData.Num();
+		}
+		else // ZipCrypto?
 		{
-			const uint16 Temp = Key2 | 2;
-			DecryptedData[EncryptedIndex] = CompressedData[EncryptedIndex] ^ ((Temp * (Temp ^ 1)) >> 8);
-			UpdateKeys(DecryptedData[EncryptedIndex]);
-		}
+			if (*Offset + LocalEntryMinSize + FilenameLen + ExtraFieldLen + CompressedSize + 12 > Data.Num())
+			{
+				return false;
+			}
+			DecryptedData.AddUninitialized(CompressedSize + 12);
 
-		CompressedData = DecryptedData.GetData() + 12;
+			uint32 Key0 = 305419896;
+			uint32 Key1 = 591751049;
+			uint32 Key2 = 878082192;
+
+			auto Crc32 = [](const uint8 Byte, const uint32 Crc) -> uint32
+				{
+					return (Crc >> 8) ^ FCrc::CRCTablesSB8[0][(Crc ^ Byte) & 0xFF];
+				};
+
+			auto UpdateKeys = [&Key0, &Key1, &Key2, &Crc32](const uint8 Byte)
+				{
+					Key0 = Crc32(Byte, Key0);
+					Key1 = Key1 + (Key0 & 0xFF);
+					Key1 = Key1 * 134775813 + 1;
+					Key2 = Crc32(Key1 >> 24, Key2);
+				};
+
+			for (const uint8& Byte : Password)
+			{
+				UpdateKeys(Byte);
+			}
+
+			for (int64 EncryptedIndex = 0; EncryptedIndex < CompressedSize + 12; EncryptedIndex++)
+			{
+				const uint16 Temp = Key2 | 2;
+				DecryptedData[EncryptedIndex] = CompressedData[EncryptedIndex] ^ ((Temp * (Temp ^ 1)) >> 8);
+				UpdateKeys(DecryptedData[EncryptedIndex]);
+			}
+
+			CompressedData = DecryptedData.GetData() + 12;
+			CompressedSize = DecryptedData.Num() - 12;
+		}
+	}
+
+	if (bClearPassword)
+	{
+		SetPassword(TEXT(""));
 	}
 
 	if (Compression == 8)
@@ -5413,6 +5631,7 @@ bool FglTFRuntimeArchiveZip::GetFileContent(const FString& Filename, TArray64<ui
 	}
 	else
 	{
+		UE_LOG(LogGLTFRuntime, Error, TEXT("Unknown ZIP Compression format"));
 		return false;
 	}
 
@@ -5508,7 +5727,7 @@ bool FglTFRuntimeParser::GetJsonObjectBytes(TSharedRef<FJsonObject> JsonObject, 
 	return Bytes.Num() > 0;
 }
 
-FVector FglTFRuntimeParser::ComputeTangentY(const FVector Normal, const FVector TangetX)
+FVector glTFRuntime::ComputeTangentY(const FVector Normal, const FVector TangetX)
 {
 	float Determinant = GetBasisDeterminantSign(Normal.GetSafeNormal(),
 		(Normal ^ TangetX).GetSafeNormal(),
@@ -5517,7 +5736,7 @@ FVector FglTFRuntimeParser::ComputeTangentY(const FVector Normal, const FVector 
 	return (Normal ^ TangetX) * Determinant;
 }
 
-FVector FglTFRuntimeParser::ComputeTangentYWithW(const FVector Normal, const FVector TangetX, const float W)
+FVector glTFRuntime::ComputeTangentYWithW(const FVector Normal, const FVector TangetX, const float W)
 {
 	return (Normal ^ TangetX) * W;
 }
@@ -6421,6 +6640,11 @@ FString FglTFRuntimeParser::GetGenerator() const
 	return GetJsonObjectString(Asset.ToSharedRef(), "generator", "");
 }
 
+TSharedPtr<FJsonObject> FglTFRuntimeParser::GetAssetMeta() const
+{
+	return GetJsonObjectFromObject(GetJsonRoot().ToSharedRef(), "asset");
+}
+
 bool FglTFRuntimeParser::IsArchive() const
 {
 	return Archive.IsValid();
@@ -6521,9 +6745,12 @@ TArray<FString> FglTFRuntimeParser::GetAnimationsNames(const bool bIncludeUnname
 	{
 		const TSharedRef<FJsonObject>& Animation = Animations[AnimationIndex];
 		FString Name;
-		if (bIncludeUnnameds && (!Animation->TryGetStringField(TEXT("name"), Name) || Name.IsEmpty()))
+		if (!Animation->TryGetStringField(TEXT("name"), Name) || Name.IsEmpty())
 		{
-			Name = FString::Printf(TEXT("Animation_%d"), AnimationIndex);
+			if (bIncludeUnnameds)
+			{
+				Name = FString::Printf(TEXT("Animation_%d"), AnimationIndex);
+			}
 		}
 
 		if (!Name.IsEmpty())

@@ -179,7 +179,13 @@ TArray<FString> FglTFRuntimeParser::GetJSONObjectKeysFromPath(const TArray<FglTF
 		if (CurrentObject->TryGetObject(JsonObject))
 		{
 			bFound = true;
-			(*JsonObject)->Values.GetKeys(Keys);
+			TArray<UE::FSharedString> SharedKeys;
+			(*JsonObject)->Values.GetKeys(SharedKeys);
+			Keys.Reserve(SharedKeys.Num());
+			for (const UE::FSharedString& SharedKey : SharedKeys)
+			{
+				Keys.Add(FString(SharedKey.ToView()));
+			}
 		}
 	}
 

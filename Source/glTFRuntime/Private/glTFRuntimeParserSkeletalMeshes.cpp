@@ -2715,10 +2715,10 @@ UAnimSequence* FglTFRuntimeParser::CreateSkeletalAnimationFromPath(USkeletalMesh
 
 		for (const FName& KeyName : MorphTargetKeys)
 		{
-			if (JsonFrameObject->Values.Contains(KeyName.ToString()))
+			if (JsonFrameObject->Values.Contains(UE::FSharedString(KeyName.ToString())))
 			{
 				double Value = 0;
-				if (!JsonFrameObject->Values[KeyName.ToString()]->TryGetNumber(Value))
+				if (!JsonFrameObject->Values[UE::FSharedString(KeyName.ToString())]->TryGetNumber(Value))
 				{
 					Value = 0;
 				}
